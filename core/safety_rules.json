@@ -1,0 +1,87 @@
+{
+  "safe_patterns": {
+    "paths": [
+      "%TEMP%",
+      "C:\\Windows\\Temp",
+      "$RECYCLE.BIN",
+      "C:\\Windows\\Prefetch",
+      "C:\\Windows\\SoftwareDistribution\\Download",
+      "Cache",
+      "cache",
+      ".cache",
+      "Thumbnails",
+      "logs",
+      "Logs",
+      "C:\\Windows\\Logs",
+      "C:\\Windows\\System32\\LogFiles"
+    ],
+    "extensions": [
+      ".tmp",
+      ".temp",
+      ".log",
+      ".etl",
+      ".dmp",
+      ".mdmp",
+      ".hdmp",
+      ".cache",
+      ".old",
+      ".bak",
+      ".chk"
+    ],
+    "names": [
+      "thumbs.db",
+      "desktop.ini",
+      "ehthumbs.db",
+      "IconCache.db"
+    ]
+  },
+  "protected_patterns": {
+    "paths": [
+      "C:\\Windows\\System32",
+      "C:\\Windows\\SysWOW64",
+      "C:\\Windows\\Boot",
+      "C:\\Windows\\WinSxS",
+      "drivers",
+      "C:\\Windows\\inf",
+      "C:\\Windows\\SystemResources",
+      "C:\\Windows\\servicing"
+    ],
+    "extensions": [
+      ".sys",
+      ".dll",
+      ".drv",
+      ".msc",
+      ".cpl",
+      ".mui"
+    ],
+    "names": [
+      "ntoskrnl.exe",
+      "winload.exe",
+      "winlogon.exe",
+      "csrss.exe",
+      "smss.exe",
+      "services.exe",
+      "lsass.exe",
+      "svchost.exe",
+      "System",
+      "Registry"
+    ]
+  },
+  "suggested_patterns": {
+    "paths": [
+      "Downloads",
+      "C:\\Windows\\Installer\\$PatchCache$",
+      "C:\\Windows\\assembly\\NativeImages",
+      "C:\\Windows.old",
+      "C:\\ProgramData\\Package Cache"
+    ],
+    "extensions": [
+      ".msi",
+      ".msp",
+      ".diagcab",
+      ".diagpkg"
+    ],
+    "age_threshold_days": 180,
+    "size_threshold_bytes": 104857600
+  }
+}
