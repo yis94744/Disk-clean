@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.spec
+*.manifest
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local data / logs
+*.log
+*.db
+settings.json
+scan_cache.db
+
+# Assets - local images
+bg.jpg
+source_img.jpg
+*.jpeg
+*.jpg
+*.png
+!assets/icons/*.png
+
+# Build output
+installer/*.exe
+dist/
+
+# System
+Thumbs.db
+Desktop.ini
+.superpowers/
+
+# Temp files
+_f.py
+_f2.py
+test_*.py
+*.bak
