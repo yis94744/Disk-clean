@@ -144,22 +144,29 @@ class _ProcessWorker(QObject):
             for p in procs:
                 try: p.cpu_percent()
                 except: pass
-            # Wait for measurement
-            time.sleep(0.5)
-            # Second call to get actual CPU%
+            # Wait for measurement（窗口加长到 1s，数值更稳定）
+            time.sleep(1.0)
+            # psutil 的进程 CPU% 是"单核口径"（100% = 占满 1 核），
+            # 除以逻辑核数归一化为任务管理器同款"全机占比"（0~100%）
+            cores = max(1, psutil.cpu_count(logical=True) or 1)
             processes = []
             for p in procs:
                 try:
                     info = p.as_dict()
-                    cpu = p.cpu_percent() or 0.0
+                    pname = info.get('name', '')
+                    if pname.lower() == 'system idle process':
+                        continue  # 空闲统计进程，不是真实占用
+                    cpu = (p.cpu_percent() or 0.0) / cores
                     mem = info.get('memory_info')
+                    # 程序归属解析放在工作线程：exe() 调用可能阻塞，放 UI 线程会卡顿
                     processes.append({
                         'pid': p.pid,
-                        'name': info.get('name', ''),
+                        'name': pname,
                         'cpu': cpu,
                         'mem_rss': mem.rss if mem else 0,
                         'status': info.get('status', ''),
-                        'user': (info.get('username', '') or '')[:25]
+                        'user': (info.get('username', '') or '')[:25],
+                        'sw': _resolve_software(pname, p.pid)
                     })
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -184,10 +191,15 @@ class ProcessManagerPage(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
 
+        # 第 1 行：标题（左） + 进程操作（右）
         tb = QHBoxLayout()
+        t = QLabel("进程管理")
+        t.setObjectName("pageTitle")
+        tb.addWidget(t)
+        tb.addStretch()
         self.rf_btn = QPushButton("刷新进程列表")
         self.rf_btn.setObjectName("greenBtn")
         self.rf_btn.clicked.connect(self._refresh)
@@ -196,17 +208,18 @@ class ProcessManagerPage(QWidget):
         kill_btn.setObjectName("redBtn")
         kill_btn.clicked.connect(self._kill)
         tb.addWidget(kill_btn)
-        tb.addStretch()
         layout.addLayout(tb)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["进程名称", "CPU", "内存", "PID", "状态", "用户", "程序归属"])
+        self.tree.setHeaderLabels(["进程名称", "CPU(全机)", "内存", "PID", "状态", "用户", "程序归属"])
         self.tree.setColumnWidth(0, 200); self.tree.setColumnWidth(1, 65)
         self.tree.setColumnWidth(2, 85); self.tree.setColumnWidth(3, 60)
         self.tree.setColumnWidth(4, 85); self.tree.setColumnWidth(5, 110)
         self.tree.setColumnWidth(6, 150)
         self.tree.setSortingEnabled(True); self.tree.setIndentation(20)
         self.tree.setAnimated(True); self.tree.setExpandsOnDoubleClick(True)
+        # 主题表头样式下排序指示器会被画到表头外的悬空位置，隐藏之（点击表头排序仍有效）
+        self.tree.header().setSortIndicatorShown(False)
         layout.addWidget(self.tree)
         self.sl = QLabel(""); self.sl.setStyleSheet("color:#aaa;font-size:11px;"); layout.addWidget(self.sl)
 
@@ -224,6 +237,9 @@ class ProcessManagerPage(QWidget):
         self._thread.start()
 
     def _on_data(self, processes):
+        # 排序开启时逐行插入是 O(n²)，先关闭，填完再恢复
+        self.tree.setSortingEnabled(False)
+        self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         groups = defaultdict(list)
         for proc in processes: groups[proc['name'].lower()].append(proc)
@@ -231,7 +247,7 @@ class ProcessManagerPage(QWidget):
         visible = 0; total_p = len(processes)
         for _, procs in sorted_groups:
             t_cpu = sum(p['cpu'] for p in procs); t_mem = sum(p['mem_rss'] for p in procs)
-            sw_name = _resolve_software(procs[0]['name'], procs[0]['pid'])
+            sw_name = procs[0].get('sw') or _resolve_software(procs[0]['name'], procs[0]['pid'])
             if len(procs) == 1:
                 p = procs[0]
                 it = QTreeWidgetItem()
@@ -258,8 +274,11 @@ class ProcessManagerPage(QWidget):
                     cpu_c = size_color(p['cpu']); child.setForeground(1, QColor(cpu_c))
                     child.setData(0, 256, p['pid']); par.addChild(child)
         self.rf_btn.setEnabled(True)
-        self.sl.setText(f"共 {total_p} 个进程，显示 {visible} 个组")
-        self.status_message.emit(f"进程管理: {total_p} 个进程")
+        self.tree.setUpdatesEnabled(True)
+        self.tree.setSortingEnabled(True)
+        total_cpu = sum(p['cpu'] for p in processes)
+        self.sl.setText(f"共 {total_p} 个进程，显示 {visible} 个组 | CPU 为全机占比，合计 {total_cpu:.1f}%")
+        self.status_message.emit(f"进程管理: {total_p} 个进程 | CPU 合计 {total_cpu:.1f}%")
 
     def _kill(self):
         sel = self.tree.currentItem()

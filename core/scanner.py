@@ -12,14 +12,8 @@ SKIP_NAMES = frozenset({
     "Windows", "WinSxS",
 })
 
-# Directories to skip entirely (won't even enter)
-SKIP_ROOTS = frozenset({
-    "C:\Windows",
-    "C:\ProgramData\Packages",
-})
-
-# Priority scan paths - scanned first, results shown immediately
-PRIORITY_PATHS = []  # Will be populated dynamically
+# expert_mode 开启时仍然扫描的"垃圾"目录（默认跳过，因为它们正是清理对象）
+EXPERT_INCLUDE_DIRS = frozenset({"Temp", "tmp", "cache", "logs", "Logs"})
 
 SKIP_EXTS = frozenset({
     ".tmp", ".log", ".cache", ".etl", ".evtx", ".pf", ".dmp",
@@ -84,6 +78,15 @@ class ScanWorker(QThread):
         self._emit_count = 0
         self._results_sent = False
 
+        # 设置项：show_system_files 显示 Windows 目录；expert_mode 包含 Temp/cache 等垃圾目录
+        try:
+            from utils.themes import load_settings
+            _settings = load_settings()
+        except Exception:
+            _settings = {}
+        self._show_system = bool(_settings.get("show_system_files", False))
+        self._expert = bool(_settings.get("expert_mode", False))
+
         # Build priority paths
         userprofile = _os.environ.get("USERPROFILE", "C:\\Users")
         homedrive = _os.environ.get("HOMEDRIVE", "C:")
@@ -121,7 +124,7 @@ class ScanWorker(QThread):
                         continue
                     ename = entry.name
                     epath = _os.path.normpath(entry.path)
-                    if ename == "Windows":
+                    if ename == "Windows" and not getattr(self, "_show_system", False):
                         continue
                     if ename in SKIP_NAMES or ename[:1] in (".", "$"):
                         continue
@@ -164,12 +167,25 @@ class ScanWorker(QThread):
         stack = [root]
         min_size = getattr(self, 'min_size', 1048576)
         limit = getattr(self, 'scan_limit', 50000)
+        evaluated = 0
+        try:
+            from core import safety_engine
+        except Exception:
+            safety_engine = None
         while stack and len(result) < limit:
             n = stack.pop()
             for child in getattr(n, 'children', []):
                 if getattr(child, 'is_dir', False):
                     stack.append(child)
                 elif getattr(child, 'size', 0) >= min_size or getattr(child, 'ext', '') in self._LARGE_EXTS:
+                    # 安全评分只在 ≥1MB 的文件上计算且有上限，避免拖慢大扫描
+                    if (safety_engine is not None and evaluated < 5000
+                            and getattr(child, 'size', 0) >= 1048576):
+                        try:
+                            child.safety = safety_engine.evaluate_fast(child.path, child.size, child.ext)
+                            evaluated += 1
+                        except Exception:
+                            pass
                     result.append(child)
         return result
 
@@ -192,7 +208,8 @@ class ScanWorker(QThread):
                 if entry.is_dir(follow_symlinks=False):
                     ename = entry.name
                     if ename in SKIP_NAMES or ename[:1] in (".", "$"):
-                        continue
+                        if not (getattr(self, "_expert", False) and ename in EXPERT_INCLUDE_DIRS):
+                            continue
                     subdirs.append((entry.path, ename))
                 else:
                     try:

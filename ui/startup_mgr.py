@@ -1,9 +1,13 @@
-"""Startup Manager - refined categories + open folder + disable"""
+"""Startup Manager - refined categories + open folder + real disable via StartupApproved"""
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox, QMenu, QComboBox)
 from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QFont, QColor, QAction
 import os as _os, winreg, subprocess as _sp
+from utils.helpers import recycle_path
+
+STARTUP_APPROVED_RUN = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+DISABLED_BINARY = b"\x03\x00\x00\x00" + b"\x00" * 8  # 0x03 = disabled, + FILETIME placeholder
 
 # Refined category definitions
 CATEGORIES = {
@@ -94,8 +98,7 @@ class StartupManagerPage(QWidget):
         layout = QVBoxLayout(self); layout.setContentsMargins(12,12,12,12); layout.setSpacing(8)
         tb = QHBoxLayout()
         t = QLabel("\u542f\u52a8\u7ba1\u7406")
-        t.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
-        t.setStyleSheet("color: #e0e0e0;"); tb.addWidget(t); tb.addStretch()
+        t.setObjectName("pageTitle"); tb.addWidget(t); tb.addStretch()
         r = QPushButton("\u5237\u65b0"); r.clicked.connect(self._load); tb.addWidget(r)
         self.open_btn = QPushButton("\u6253\u5f00\u4f4d\u7f6e"); self.open_btn.clicked.connect(self._open_selected)
         tb.addWidget(self.open_btn)
@@ -125,10 +128,31 @@ class StartupManagerPage(QWidget):
         layout.addWidget(self.tree)
         self.slbl = QLabel(""); self.slbl.setStyleSheet("color:#888;"); layout.addWidget(self.slbl)
 
+    def _load_disabled_names(self):
+        """Value names marked disabled in StartupApproved (HKCU view, merged)."""
+        disabled = set()
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN)
+            i = 0
+            while True:
+                try:
+                    n, d, _ = winreg.EnumValue(key, i)
+                    if isinstance(d, (bytes, bytearray)) and len(d) >= 4 and d[0] & 0x01:
+                        disabled.add(n)
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+        except OSError:
+            pass
+        return disabled
+
     def _load(self):
         self.tree.clear(); self._entries = []
-        reg_root = 0x80000000  # HKEY_CURRENT_USER
-        reg_lm = 0x80000002    # HKEY_LOCAL_MACHINE
+        disabled_names = self._load_disabled_names()
+        # 注意：0x80000000 是 HKEY_CLASSES_ROOT，HKCU 必须用 winreg.HKEY_CURRENT_USER
+        reg_root = winreg.HKEY_CURRENT_USER
+        reg_lm = winreg.HKEY_LOCAL_MACHINE
         paths = [(reg_root, r"Software\Microsoft\Windows\CurrentVersion\Run", "HKCU"),
                  (reg_lm, r"Software\Microsoft\Windows\CurrentVersion\Run", "HKLM")]
         # Also check RunOnce and WOW6432Node
@@ -139,7 +163,7 @@ class StartupManagerPage(QWidget):
                 try:
                     n, d, _ = winreg.EnumValue(key, i)
                     cat = _classify_startup(n, str(d), "HKLM(32bit)")
-                    self._entries.append({"name":n,"cmd":str(d),"source":"HKLM(32bit)","cat":cat,"hkey":reg_lm,"subkey":r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run","type":"registry"})
+                    self._entries.append({"name":n,"cmd":str(d),"source":"HKLM(32bit)","cat":cat,"hkey":reg_lm,"subkey":r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run","type":"registry","disabled":n in disabled_names})
                 except OSError: continue
             winreg.CloseKey(key)
         except OSError: pass
@@ -151,7 +175,7 @@ class StartupManagerPage(QWidget):
                     try:
                         n, d, _ = winreg.EnumValue(key, i)
                         cat = _classify_startup(n, str(d), src)
-                        self._entries.append({"name":n,"cmd":str(d),"source":src,"cat":cat,"hkey":hkey_val,"subkey":sub,"type":"registry"})
+                        self._entries.append({"name":n,"cmd":str(d),"source":src,"cat":cat,"hkey":hkey_val,"subkey":sub,"type":"registry","disabled":n in disabled_names})
                     except OSError: continue
                 winreg.CloseKey(key)
             except OSError: continue
@@ -159,17 +183,21 @@ class StartupManagerPage(QWidget):
         sf = _os.path.join(_os.environ.get("APPDATA",""), "Microsoft","Windows","Start Menu","Programs","Startup")
         if _os.path.exists(sf):
             for fn in _os.listdir(sf):
+                if fn.lower() == "desktop.ini":
+                    continue
                 fp = _os.path.join(sf, fn)
-                cat = _classify_startup(fn, fp, "\u542f\u52a8\u6587\u4ef6\u5939")
-                self._entries.append({"name":fn,"cmd":fp,"source":"\u542f\u52a8\u6587\u4ef6\u5939","cat":cat,"type":"shortcut","path":fp})
+                cat = _classify_startup(fn, fp, "启动文件夹")
+                self._entries.append({"name":fn,"cmd":fp,"source":"启动文件夹","cat":cat,"type":"shortcut","path":fp,"disabled":False})
 
         # Common startup folder
         csf = _os.path.join(_os.environ.get("PROGRAMDATA",""), "Microsoft","Windows","Start Menu","Programs","Startup")
         if _os.path.exists(csf):
             for fn in _os.listdir(csf):
+                if fn.lower() == "desktop.ini":
+                    continue
                 fp = _os.path.join(csf, fn)
-                cat = _classify_startup(fn, fp, "\u516c\u5171\u542f\u52a8")
-                self._entries.append({"name":fn,"cmd":fp,"source":"\u516c\u5171\u542f\u52a8","cat":cat,"type":"shortcut","path":fp})
+                cat = _classify_startup(fn, fp, "公共启动")
+                self._entries.append({"name":fn,"cmd":fp,"source":"公共启动","cat":cat,"type":"shortcut","path":fp,"disabled":False})
 
         self._apply_filter(self.cat_combo.currentData())
 
@@ -181,10 +209,15 @@ class StartupManagerPage(QWidget):
             item = QTreeWidgetItem()
             item.setCheckState(0, Qt.Unchecked)
             item.setText(1, e["name"]); item.setText(2, e["cmd"])
-            item.setText(3, e["source"]); item.setText(4, e["cat"]); item.setText(5, e["type"])
+            item.setText(3, e["source"]); item.setText(4, e["cat"])
+            item.setText(5, ("已禁用" if e.get("disabled") else "") + e["type"])
+            color = CAT_COLORS_STARTUP.get(e["cat"], "#888")
+            if e.get("disabled"):
+                color = "#666"
             try:
-                color = CAT_COLORS_STARTUP.get(e["cat"], "#888")
                 item.setForeground(4, QColor(color))
+                if e.get("disabled"):
+                    item.setForeground(1, QColor("#777"))
             except: pass
             item.setData(1, Qt.UserRole, idx)
             self.tree.addTopLevelItem(item)
@@ -229,26 +262,36 @@ class StartupManagerPage(QWidget):
             QMessageBox.information(self, "\u63d0\u793a", "\u8bf7\u5148\u9009\u62e9\u8981\u7981\u7528\u7684\u542f\u52a8\u9879")
             return
         names = chr(10).join(it.text(1) for it, _ in td[:8])
-        if len(td) > 8: names += chr(10) + f"... \u8fd8\u6709 {len(td)-8} \u9879"
-        r = QMessageBox.warning(self, "\u786e\u8ba4\u7981\u7528",
-            f"\u786e\u5b9a\u8981\u7981\u7528\u4ee5\u4e0b\u542f\u52a8\u9879\u5417\uff1f\n\n{names}",
+        if len(td) > 8: names += chr(10) + f"... 还有 {len(td)-8} 项"
+        r = QMessageBox.warning(self, "确认禁用",
+            f"确定要禁用以下启动项吗？\n\n{names}\n\n"
+            "注册表启动项将被禁用（可在任务管理器-启动中重新启用），\n"
+            "快捷方式将移入回收站。",
             QMessageBox.Yes|QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes: return
         cleaned = 0; failed = 0
         for it, e in td:
             try:
                 if e["type"] == "registry":
-                    key = winreg.OpenKey(e["hkey"], e["subkey"], 0, winreg.KEY_SET_VALUE)
-                    winreg.DeleteValue(key, e["name"]); winreg.CloseKey(key)
+                    # 写入 StartupApproved 真禁用（不删除，可随时恢复）
+                    try:
+                        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN)
+                    except OSError:
+                        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_RUN, 0, winreg.KEY_SET_VALUE)
+                    try:
+                        winreg.SetValueEx(key, e["name"], 0, winreg.REG_BINARY, DISABLED_BINARY)
+                    finally:
+                        winreg.CloseKey(key)
                     cleaned += 1
                 elif e["type"] == "shortcut":
                     fp = e.get("path", e["cmd"])
-                    if _os.path.exists(fp): _os.remove(fp); cleaned += 1
+                    if _os.path.exists(fp) and recycle_path(fp): cleaned += 1
+                    else: failed += 1
                 else: failed += 1
-                it.setHidden(True)
-            except Exception as ex: failed += 1
-        msg = f"\u5df2\u7981\u7528 {cleaned} \u9879"
-        if failed: msg += f", {failed} \u5931\u8d25"
+            except Exception:
+                failed += 1
+        msg = f"已禁用 {cleaned} 项"
+        if failed: msg += f", {failed} 失败"
         self.status_message.emit(msg)
-        QMessageBox.information(self, "\u7ed3\u679c", msg)
+        QMessageBox.information(self, "结果", msg)
         QTimer.singleShot(500, self._load)

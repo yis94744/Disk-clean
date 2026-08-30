@@ -2,9 +2,22 @@
 """Software uninstaller - registry scanner + executor + force uninstall"""
 import os, subprocess, winreg, shutil, time
 from PySide6.QtCore import QObject, Signal
+from utils.helpers import recycle_path
 
 SP_KWARGS = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace",
              "timeout": 180, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+# 进程名 -> 永不允许强制卸载器结束的系统关键进程
+PROTECTED_PROCESSES = {
+    "system", "registry", "idle", "explorer.exe", "svchost.exe", "csrss.exe",
+    "winlogon.exe", "services.exe", "lsass.exe", "smss.exe", "wininit.exe",
+    "dwm.exe", "fontdrvhost.exe", "taskhostw.exe", "sihost.exe", "ctfmon.exe",
+    "conhost.exe", "spoolsv.exe", "msmpeng.exe", "securityhealthservice.exe",
+}
+
+def _name_token(text):
+    """Lowercase alphanumeric token of an app/publisher name for matching."""
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
 
 class AppInfo:
     __slots__ = ("name","version","publisher","install_location",
@@ -38,9 +51,9 @@ class UninstallWorker(QObject):
     def scan_all(self):
         apps = []; seen = set()
         regs = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
         for hive, subkey in regs:
             try:
@@ -49,101 +62,104 @@ class UninstallWorker(QObject):
                 while True:
                     try:
                         skn = winreg.EnumKey(key, i)
-                        full = subkey + "\\" + skn
-                        sk = winreg.OpenKey(hive, full)
-                        try:
-                            name = self._get_val(sk, "DisplayName")
-                            if name and name.strip() and name not in seen:
-                                seen.add(name)
-                                app = AppInfo()
-                                app.name = name
-                                app.version = self._get_val(sk, "DisplayVersion")
-                                app.publisher = self._get_val(sk, "Publisher")
-                                app.install_location = self._get_val(sk, "InstallLocation")
-                                app.uninstall_string = self._get_val(sk, "UninstallString") or self._get_val(sk, "QuietUninstallString")
-                                app.display_icon = self._get_val(sk, "DisplayIcon")
-                                app.install_date = self._get_val(sk, "InstallDate")
-                                try:
-                                    sz = winreg.QueryValueEx(sk, "EstimatedSize")[0]
-                                    app.estimated_size = sz * 1024
-                                except: app.estimated_size = 0
-                                app.registry_key = full
-                                app.hive = "HKLM" if hive == winreg.HKEY_LOCAL_MACHINE else "HKCU"
-                                # Smart system detection
-                                is_ms = app.publisher in {"Microsoft Corporation", "Microsoft", "Windows"}
-                                in_sys_dir = False
-                                if app.install_location:
-                                    ll = app.install_location.lower()
-                                    for sd in self.SYSTEM_DIRS:
-                                        if ll.startswith(sd.lower()):
-                                            in_sys_dir = True; break
-                                # System: in Windows dir OR is MS runtime/update/driver
-                                if in_sys_dir:
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        sk = winreg.OpenKey(hive, subkey + "\\" + skn)
+                    except OSError:
+                        continue
+                    try:
+                        name = self._get_val(sk, "DisplayName")
+                        if name and name.strip() and name not in seen:
+                            seen.add(name)
+                            app = AppInfo()
+                            app.name = name
+                            app.version = self._get_val(sk, "DisplayVersion")
+                            app.publisher = self._get_val(sk, "Publisher")
+                            app.install_location = self._get_val(sk, "InstallLocation")
+                            app.uninstall_string = self._get_val(sk, "UninstallString") or self._get_val(sk, "QuietUninstallString")
+                            app.display_icon = self._get_val(sk, "DisplayIcon")
+                            app.install_date = self._get_val(sk, "InstallDate")
+                            try:
+                                sz = winreg.QueryValueEx(sk, "EstimatedSize")[0]
+                                app.estimated_size = sz * 1024
+                            except: app.estimated_size = 0
+                            app.registry_key = subkey + "\\" + skn
+                            app.hive = "HKLM" if hive == winreg.HKEY_LOCAL_MACHINE else "HKCU"
+                            # Smart system detection
+                            is_ms = app.publisher in {"Microsoft Corporation", "Microsoft", "Windows"}
+                            in_sys_dir = False
+                            if app.install_location:
+                                ll = app.install_location.lower()
+                                for sd in self.SYSTEM_DIRS:
+                                    if ll.startswith(sd.lower()):
+                                        in_sys_dir = True; break
+                            # System: in Windows dir OR is MS runtime/update/driver
+                            if in_sys_dir:
+                                app.is_system = True
+                            elif is_ms:
+                                nl = app.name.lower()
+                                sys_keywords = ["update", "runtime", "driver", "redistributable",
+                                                "sdk", ".net", "visual c++", "edge webview",
+                                                "windows", "service pack", "security",
+                                                "application verifier", "clickonce",
+                                                "windows sdk", "windows driver",
+                                                "c++", "desktop runtime", "asp.net",
+                                                ".net framework", "net framework",
+                                                "microsoft edge", "edge update",
+                                                "onedrive", "defender", "silverlight"]
+                                if any(kw in nl for kw in sys_keywords):
                                     app.is_system = True
-                                elif is_ms:
-                                    nl = app.name.lower()
-                                    sys_keywords = ["update", "runtime", "driver", "redistributable",
-                                                    "sdk", ".net", "visual c++", "edge webview",
-                                                    "windows", "service pack", "security",
-                                                    "application verifier", "clickonce",
-                                                    "windows sdk", "windows driver",
-                                                    "c++", "desktop runtime", "asp.net",
-                                                    ".net framework", "net framework",
-                                                    "microsoft edge", "edge update",
-                                                    "onedrive", "defender", "silverlight"]
-                                    if any(kw in nl for kw in sys_keywords):
-                                        app.is_system = True
-                                # === SMART ORPHAN DETECTION ===
-                                # Level 0: safe
-                                # Level 1: suspected orphan (missing uninstaller but system/normal component)
-                                # Level 2: confirmed orphan (install dir gone, user software)
+                            # === SMART ORPHAN DETECTION ===
+                            # Level 0: safe
+                            # Level 1: suspected orphan (missing uninstaller but system/normal component)
+                            # Level 2: confirmed orphan (install dir gone, user software)
+                            app.is_orphan = False
+                            app.orphan_level = 0
+
+                            # NEVER mark system software as orphan
+                            if app.is_system:
+                                apps.append(app)
+                                continue
+
+                            # Check install directory
+                            loc_exists = False
+                            loc = ""
+                            if app.install_location:
+                                loc = app.install_location.strip('"')
+                                loc_exists = os.path.exists(loc)
+
+                            # Check uninstaller
+                            uninstaller_exists = False
+                            has_uninstall_string = False
+                            if app.uninstall_string:
+                                has_uninstall_string = True
+                                us = app.uninstall_string.strip('"')
+                                exe_path = us.split('" ')[0] if '"' in us else us.split(' ')[0]
+                                uninstaller_exists = os.path.exists(exe_path.strip('"'))
+
+                            # Level 2 (confirmed orphan): install dir AND uninstaller both gone, and it had both
+                            if app.install_location and not loc_exists and has_uninstall_string and not uninstaller_exists:
+                                app.is_orphan = True
+                                app.orphan_level = 2
+                                app.orphan_reason = "安装目录和卸载程序均不存在"
+                            # Level 1 (suspected): install dir gone, no uninstaller info
+                            elif app.install_location and not loc_exists and not has_uninstall_string:
+                                app.is_orphan = True
+                                app.orphan_level = 1
+                                app.orphan_reason = "安装目录不存在(可能为组件)"
+                            # Level 1: uninstaller gone but install dir exists (uninstaller was moved)
+                            elif loc_exists and has_uninstall_string and not uninstaller_exists:
+                                app.is_orphan = True
+                                app.orphan_level = 1
+                                app.orphan_reason = "卸载程序缺失(目录仍存在)"
+                            # Level 0: everything OK or only partial info
+                            else:
                                 app.is_orphan = False
                                 app.orphan_level = 0
-
-                                # NEVER mark system software as orphan
-                                if app.is_system:
-                                    apps.append(app)
-                                    continue
-
-                                # Check install directory
-                                loc_exists = False
-                                loc = ""
-                                if app.install_location:
-                                    loc = app.install_location.strip('"')
-                                    loc_exists = os.path.exists(loc)
-
-                                # Check uninstaller
-                                uninstaller_exists = False
-                                has_uninstall_string = False
-                                if app.uninstall_string:
-                                    has_uninstall_string = True
-                                    us = app.uninstall_string.strip('"')
-                                    exe_path = us.split('" ')[0] if '"' in us else us.split(' ')[0]
-                                    uninstaller_exists = os.path.exists(exe_path.strip('"'))
-
-                                # Level 2 (confirmed orphan): install dir AND uninstaller both gone, and it had both
-                                if app.install_location and not loc_exists and has_uninstall_string and not uninstaller_exists:
-                                    app.is_orphan = True
-                                    app.orphan_level = 2
-                                    app.orphan_reason = "安装目录和卸载程序均不存在"
-                                # Level 1 (suspected): install dir gone, no uninstaller info
-                                elif app.install_location and not loc_exists and not has_uninstall_string:
-                                    app.is_orphan = True
-                                    app.orphan_level = 1
-                                    app.orphan_reason = "安装目录不存在(可能为组件)"
-                                # Level 1: uninstaller gone but install dir exists (uninstaller was moved)
-                                elif loc_exists and has_uninstall_string and not uninstaller_exists:
-                                    app.is_orphan = True
-                                    app.orphan_level = 1
-                                    app.orphan_reason = "卸载程序缺失(目录仍存在)"
-                                # Level 0: everything OK or only partial info
-                                else:
-                                    app.is_orphan = False
-                                    app.orphan_level = 0
-                                apps.append(app)
-                        finally: winreg.CloseKey(sk)
-                    except OSError: break
-                    i += 1
+                            apps.append(app)
+                    finally: winreg.CloseKey(sk)
                 winreg.CloseKey(key)
             except OSError: pass
         apps.sort(key=lambda a: a.name.lower())
@@ -276,9 +292,9 @@ class UninstallExecutor(QObject):
             pass
         # Also check alternate registry locations
         reg_paths = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
         for root_key, subpath in reg_paths:
             try:
@@ -302,7 +318,7 @@ class UninstallExecutor(QObject):
         return False
 
     def _kill_related(self, app):
-        """Kill processes related to the app."""
+        """Kill processes related to the app (conservative matching)."""
         import psutil
         exe_names = set()
         if app.install_location:
@@ -314,11 +330,19 @@ class UninstallExecutor(QObject):
                             exe_names.add(f.lower())
                     if len(exe_names) > 50:
                         break
+        # 按名称匹配时要求词首命中且名字足够长，避免误杀包含名的无关进程(如 edge 误杀 msedge)
+        name_token = _name_token(app.name)
+        name_match = len(name_token) >= 5
         killed = 0
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 pname = (proc.info['name'] or '').lower()
-                if pname in exe_names or app.name.lower().replace(' ', '') in pname:
+                if not pname or pname in PROTECTED_PROCESSES:
+                    continue
+                stem = pname[:-4] if pname.endswith('.exe') else pname
+                hit = pname in exe_names or (
+                    name_match and (stem == name_token or stem.replace(' ', '').startswith(name_token)))
+                if hit:
                     proc.kill()
                     self.output.emit("  已终止: " + proc.info['name'] + " (PID: " + str(proc.info['pid']) + ")")
                     killed += 1
@@ -327,32 +351,40 @@ class UninstallExecutor(QObject):
             self.output.emit("  未发现运行中的进程")
 
     def _deep_delete(self, app):
-        """Delete installation directory and all related files."""
+        """Delete installation directory and all related files (Recycle Bin first)."""
         deleted = 0
         dirs_to_check = []
         if app.install_location:
             dirs_to_check.append(app.install_location.strip('"'))
-        # Also check common install paths
-        name_clean = app.name.replace(' ', '').replace('-', '').lower()
-        for base in [r"C:\\Program Files", r"C:\\Program Files (x86)", os.environ.get("LOCALAPPDATA", ""), os.environ.get("PROGRAMDATA", "")]:
-            if not base:
-                continue
-            try:
-                for entry in os.scandir(base):
-                    if name_clean in entry.name.lower().replace(' ', ''):
-                        dirs_to_check.append(entry.path)
-            except: pass
+        # Also check common install paths (name-token containment, length-guarded)
+        name_token = _name_token(app.name)
+        if len(name_token) >= 4:
+            for base in [r"C:\Program Files", r"C:\Program Files (x86)",
+                         os.environ.get("LOCALAPPDATA", ""), os.environ.get("PROGRAMDATA", "")]:
+                if not base:
+                    continue
+                try:
+                    for entry in os.scandir(base):
+                        if name_token in _name_token(entry.name):
+                            dirs_to_check.append(entry.path)
+                except: pass
         for d in set(dirs_to_check):
             if os.path.exists(d):
                 try:
-                    if os.path.isdir(d):
-                        shutil.rmtree(d, ignore_errors=True)
-                        self.output.emit("  已删除目录: " + d)
-                        deleted += len(list(os.walk(d))) if os.path.exists(d) else 1
-                    else:
-                        os.remove(d)
-                        self.output.emit("  已删除文件: " + d)
+                    if recycle_path(d):
+                        self.output.emit("  已移入回收站: " + d)
                         deleted += 1
+                    else:
+                        # 回收站失败(路径过长/权限等)时回退为永久删除
+                        if os.path.isdir(d):
+                            shutil.rmtree(d, ignore_errors=True)
+                        else:
+                            os.remove(d)
+                        if not os.path.exists(d):
+                            self.output.emit("  已删除: " + d)
+                            deleted += 1
+                        else:
+                            self.output.emit("  删除失败: " + d)
                 except Exception as e:
                     self.output.emit("  删除失败: " + d + " - " + str(e))
         return deleted
@@ -375,16 +407,16 @@ class UninstallExecutor(QObject):
             except Exception as e:
                 self.output.emit("  注册表项删除异常: " + app.registry_key + " - " + str(e))
 
+        # 只扫描三个卸载键，仅按软件名匹配键名，绝不按发布者匹配——
+        # 否则发布者为 Microsoft 的软件会波及 SOFTWARE 下海量无关键
         reg_paths = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         ]
-        name_lower = app.name.lower()
-        publisher_lower = (app.publisher or "").lower()
+        name_token = _name_token(app.name)
+        if len(name_token) < 3:
+            return cleaned
         for root_key, subpath in reg_paths:
             try:
                 key = winreg.OpenKey(root_key, subpath, 0, winreg.KEY_READ | winreg.KEY_WRITE)
@@ -393,8 +425,7 @@ class UninstallExecutor(QObject):
                 while True:
                     try:
                         skn = winreg.EnumKey(key, i)
-                        sk_lower = skn.lower()
-                        if name_lower in sk_lower or (publisher_lower and publisher_lower in sk_lower):
+                        if name_token in _name_token(skn):
                             to_delete.append(skn)
                     except OSError: break
                     i += 1
@@ -414,10 +445,11 @@ class UninstallExecutor(QObject):
         return cleaned
 
     def _clean_appdata(self, app):
-        """Clean user AppData directories."""
+        """Clean user AppData directories (Recycle Bin first, name-token match)."""
         cleaned = 0
-        name_clean = app.name.replace(' ', '').replace('-', '').lower()
-        publisher_clean = (app.publisher or "").replace(' ', '').replace('-', '').lower()
+        name_token = _name_token(app.name)
+        if len(name_token) < 3:
+            return cleaned
         bases = [
             os.environ.get("APPDATA", ""),
             os.environ.get("LOCALAPPDATA", ""),
@@ -427,24 +459,21 @@ class UninstallExecutor(QObject):
                 continue
             try:
                 for entry in os.scandir(base):
-                    ename = entry.name.lower().replace(' ', '').replace('-', '')
-                    if name_clean in ename or (publisher_clean and publisher_clean in ename):
-                        try:
-                            if entry.is_dir():
-                                shutil.rmtree(entry.path, ignore_errors=True)
-                            else:
-                                os.remove(entry.path)
-                            self.output.emit("  已清理用户数据: " + entry.name)
+                    if name_token in _name_token(entry.name):
+                        if recycle_path(entry.path):
+                            self.output.emit("  已移入回收站(用户数据): " + entry.name)
                             cleaned += 1
-                        except Exception as e:
-                            self.output.emit("  清理失败: " + entry.name + " - " + str(e))
+                        else:
+                            self.output.emit("  清理失败: " + entry.name)
             except: pass
         return cleaned
 
     def _clean_shortcuts(self, app):
-        """Clean Start Menu and Desktop shortcuts."""
+        """Clean Start Menu and Desktop shortcuts (Recycle Bin)."""
         cleaned = 0
-        name_clean = app.name.replace(' ', '').replace('-', '').lower()
+        name_token = _name_token(app.name)
+        if len(name_token) < 3:
+            return cleaned
         shortcut_dirs = [
             os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
             os.path.join(os.environ.get("PROGRAMDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
@@ -456,22 +485,18 @@ class UninstallExecutor(QObject):
                 continue
             for root, dirs, files in os.walk(sdir):
                 for f in files:
-                    if name_clean in f.lower().replace(' ', '').replace('-', '') and f.lower().endswith(('.lnk', '.url')):
+                    if name_token in _name_token(f) and f.lower().endswith(('.lnk', '.url')):
                         fp = os.path.join(root, f)
-                        try:
-                            os.remove(fp)
-                            self.output.emit("  已删除快捷方式: " + f)
+                        if recycle_path(fp):
+                            self.output.emit("  已移入回收站(快捷方式): " + f)
                             cleaned += 1
-                        except: pass
                 # Also delete matching directories
                 for d in list(dirs):
-                    if name_clean in d.lower().replace(' ', '').replace('-', ''):
+                    if name_token in _name_token(d):
                         dp = os.path.join(root, d)
-                        try:
-                            shutil.rmtree(dp, ignore_errors=True)
-                            self.output.emit("  已删除快捷方式目录: " + d)
+                        if recycle_path(dp):
+                            self.output.emit("  已移入回收站(快捷方式目录): " + d)
                             cleaned += 1
-                        except: pass
         return cleaned
 
 

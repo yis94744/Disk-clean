@@ -1,7 +1,7 @@
-"""System Info - thread-safe loading with QThread"""
+"""System Info - thread-safe loading with QThread + progress bar"""
 import warnings
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QScrollArea, QFrame)
+    QPushButton, QScrollArea, QFrame, QProgressBar)
 from PySide6.QtCore import Signal, Qt, QTimer, QThread, QObject
 from PySide6.QtGui import QFont
 from utils.helpers import format_size
@@ -9,11 +9,13 @@ from core.system_query import SystemQuery
 
 class _SystemWorker(QObject):
     progress = Signal(str)
+    progress_value = Signal(int)
     finished = Signal(dict)
 
     def run(self):
         query = SystemQuery()
         query.progress.connect(self.progress.emit)
+        query.progress_value.connect(self.progress_value.emit)
         query.finished.connect(self.finished.emit)
         query.query_all()
 
@@ -26,9 +28,8 @@ class SystemInfoPage(QWidget):
         self._loading = False
         self._thread = None
         self._worker = None
-        self._load_dots = 0
-        self._load_timer = None
         self._loading_label = None
+        self._progress = None
         self._setup_ui()
         QTimer.singleShot(500, self._start_load)
 
@@ -36,14 +37,15 @@ class SystemInfoPage(QWidget):
         layout = QVBoxLayout(self); layout.setContentsMargins(16, 16, 16, 16)
         tb = QHBoxLayout()
         t = QLabel("\u7cfb\u7edf\u4fe1\u606f")
-        t.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
-        t.setStyleSheet("color:#e0e0e0;"); tb.addWidget(t); tb.addStretch()
+        t.setObjectName("pageTitle"); tb.addWidget(t); tb.addStretch()
         r = QPushButton("\u5237\u65b0"); r.clicked.connect(self._start_load); tb.addWidget(r)
         layout.addLayout(tb)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
-        self.content = QWidget(); self.content.setStyleSheet("background:rgba(20,20,40,0.50);border-radius:10px;")
+        self.content = QWidget()
+        from utils.themes import panel_qss
+        self.content.setStyleSheet(panel_qss())
         self._clayout = QVBoxLayout(self.content)
         self._clayout.setContentsMargins(0,0,0,0); self._clayout.setSpacing(16)
         self.scroll.setWidget(self.content); layout.addWidget(self.scroll)
@@ -52,22 +54,32 @@ class SystemInfoPage(QWidget):
         if visible and not self._loaded and not self._loading:
             self._start_load()
 
-    def _start_load(self):
-        if self._loading: return
-        self._loading = True; self._loaded = True
+    def update_theme_styles(self):
+        from utils.themes import panel_qss
+        self.content.setStyleSheet(panel_qss())
+
+    def _clear_content(self):
         while self._clayout.count():
             item = self._clayout.takeAt(0)
             w = item.widget()
             if w: w.deleteLater()
-        if self._load_timer and self._load_timer.isActive(): self._load_timer.stop()
+
+    def _start_load(self):
+        if self._loading: return
+        self._loading = True; self._loaded = True
+        self._clear_content()
+
         self._loading_label = QLabel("\u6b63\u5728\u8bfb\u53d6\u7cfb\u7edf\u6570\u636e...")
-        self._loading_label.setStyleSheet("color:#58a6ff;font-size:18px;padding:40px;font-weight:bold;background:transparent;")
+        self._loading_label.setStyleSheet("color:#58a6ff;font-size:16px;padding:24px;font-weight:bold;background:transparent;")
         self._loading_label.setAlignment(Qt.AlignCenter)
         self._clayout.addWidget(self._loading_label)
-        self._loading_label.repaint()
-        self._load_dots = 0
-        self._load_timer = QTimer()
-        self._load_timer.timeout.connect(self._animate_loading); self._load_timer.start(400)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(True)
+        self._clayout.addWidget(self._progress)
+        self._clayout.addStretch()
 
         # Clean up previous thread
         if self._thread and self._thread.isRunning():
@@ -78,18 +90,30 @@ class SystemInfoPage(QWidget):
         self._worker = _SystemWorker()
         self._worker.moveToThread(self._thread)
         self._worker.finished.connect(self._display)
-        self._worker.progress.connect(self.status_message.emit)
+        self._worker.progress.connect(self._on_step)
+        self._worker.progress_value.connect(self._on_step_value)
         self._thread.started.connect(self._worker.run)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.finished.connect(lambda: setattr(self, '_thread', None))
         self._thread.start()
 
-    def _animate_loading(self):
-        self._load_dots = (self._load_dots + 1) % 4
-        dots = "." * self._load_dots
+    def _on_step(self, msg):
         if self._loading_label:
-            try: self._loading_label.setText("\u6b63\u5728\u8bfb\u53d6\u7cfb\u7edf\u6570\u636e" + dots)
+            try: self._loading_label.setText(msg)
             except: pass
+        self.status_message.emit(msg)
+
+    def _on_step_value(self, value):
+        if self._progress is not None:
+            try: self._progress.setValue(int(value))
+            except: pass
+
+    @staticmethod
+    def _temp_color(t):
+        if t is None: return "#8b949e"
+        if t >= 85: return "#F44336"
+        if t >= 60: return "#FF9800"
+        return "#4CAF50"
 
     def _card(self, title):
         card = QFrame(); card.setObjectName("card")
@@ -107,13 +131,17 @@ class SystemInfoPage(QWidget):
         vl.setStyleSheet(f"color:{color};font-size:11px;background:transparent;"); vl.setWordWrap(True)
         row.addWidget(vl, 1); parent_layout.addLayout(row)
 
+    def _hint(self, parent_layout, text):
+        hl = QLabel(text)
+        hl.setStyleSheet("color:#eab308;font-size:11px;background:transparent;")
+        hl.setWordWrap(True)
+        parent_layout.addWidget(hl)
+
     def _display(self, info):
         self._loading = False
-        if self._load_timer and self._load_timer.isActive(): self._load_timer.stop()
-        while self._clayout.count():
-            item = self._clayout.takeAt(0)
-            w = item.widget()
-            if w: w.deleteLater()
+        self._loading_label = None
+        self._progress = None
+        self._clear_content()
         if not info:
             lbl = QLabel("\u65e0\u6cd5\u83b7\u53d6\u7cfb\u7edf\u4fe1\u606f")
             lbl.setStyleSheet("color:#8b949e;font-size:14px;padding:40px;background:transparent;")
@@ -179,7 +207,7 @@ class SystemInfoPage(QWidget):
                 if g.get("driver"): self._row(cl, "\u9a71\u52a8:", g["driver"])
                 if g.get("resolution"): self._row(cl, "\u5206\u8fa8\u7387:", g["resolution"])
                 if g.get("refresh"): self._row(cl, "\u5237\u65b0\u7387:", g["refresh"] + " Hz")
-        self._clayout.addWidget(card)
+            self._clayout.addWidget(card)
         # Motherboard
         card, cl = self._card("\u4e3b\u677f & BIOS")
         mb = info.get("motherboard", {})
@@ -200,6 +228,73 @@ class SystemInfoPage(QWidget):
                 color = "#F44336" if pct > 85 else "#FF9800" if pct > 60 else "#4CAF50"
                 self._row(cl, mount, format_size(used) + " / " + format_size(total) + f" (\u5df2\u7528{pct}%, \u53ef\u7528" + format_size(d.get("free",0)) + ")", color)
             self._clayout.addWidget(card)
+        # ── 硬盘健康 / 寿命 ──
+        card, cl = self._card("\u786c\u76d8\u5065\u5eb7 / \u5bff\u547d")
+        dh = info.get("disk_health") or []
+        if not dh:
+            self._hint(cl, "\u26a0 \u672a\u80fd\u8bfb\u53d6\u786c\u76d8\u5065\u5eb7\u6570\u636e"
+                           "\uff08Get-PhysicalDisk \u4e0d\u53ef\u7528\u6216\u9700\u8981\u7ba1\u7406\u5458\u6743\u9650\uff09\u3002")
+        else:
+            hmap = {"Healthy": ("\u6b63\u5e38", "#4CAF50"),
+                    "Warning": ("\u8b66\u544a", "#FF9800"),
+                    "Unhealthy": ("\u5f02\u5e38", "#F44336")}
+            for i, d in enumerate(dh):
+                model = d.get("model") or f"\u786c\u76d8 #{i+1}"
+                if len(model) > 30: model = model[:30] + "\u2026"
+                media = d.get("media", ""); bus = d.get("bus", "")
+                kind = " / ".join(x for x in
+                    [media if media and media != "Unspecified" else "",
+                     bus if bus and bus not in ("", "Unknown") else ""] if x)
+                hn, hc = hmap.get(d.get("health", ""), ("\u672a\u77e5", "#8b949e"))
+                parts = [f"\u5065\u5eb7\u72b6\u6001: {hn}"]
+                wear = d.get("wear")
+                if wear is not None:
+                    remaining = max(0, 100 - int(wear))
+                    parts.append(f"\u5269\u4f59\u5bff\u547d: {remaining}%\uff08\u5df2\u78e8\u635f {int(wear)}%\uff09")
+                ttemp = d.get("temperature")
+                if ttemp is not None:
+                    parts.append(f"\u6e29\u5ea6: {int(ttemp)} \u00b0C")
+                hours = d.get("power_on_hours")
+                if hours:
+                    parts.append(f"\u901a\u7535: {hours} \u5c0f\u65f6\uff08\u7ea6 {hours // 24} \u5929\uff09")
+                key = model + (f"  [{kind}]" if kind else "")
+                self._row(cl, key, "  \u00b7  ".join(parts), hc)
+        self._clayout.addWidget(card)
+        # ── 温度监控 ──
+        card, cl = self._card("\u6e29\u5ea6\u76d1\u63a7")
+        mon = info.get("monitor") or {}
+        any_temp = False
+        ct = mon.get("cpu_temp")
+        if ct is not None:
+            any_temp = True
+            src = mon.get("cpu_temp_source") or ""
+            val = f"{ct:.0f} \u00b0C" + (f"\uff08{src}\uff09" if src else "")
+            self._row(cl, "CPU \u6e29\u5ea6:", val, self._temp_color(ct))
+        else:
+            self._row(cl, "CPU \u6e29\u5ea6:", "\u65e0\u6cd5\u8bfb\u53d6", "#8b949e")
+        load = mon.get("cpu_load")
+        if load is not None:
+            self._row(cl, "CPU \u5360\u7528:", f"{load}%", "#e6edf3")
+        for i, g in enumerate(mon.get("gpus") or []):
+            gt = g.get("temp")
+            if gt is not None: any_temp = True
+            nm = g.get("name") or f"GPU #{i+1}"
+            if len(nm) > 34: nm = nm[:34] + "\u2026"
+            if gt is not None:
+                val = f"{gt:.0f} \u00b0C"
+                if g.get("load"):
+                    val += f"\uff08\u8d1f\u8f7d {g['load']}%\uff09"
+            else:
+                val = "\u65e0\u6cd5\u8bfb\u53d6"
+            self._row(cl, nm + ":", val, self._temp_color(gt))
+        for f in (mon.get("fans") or [])[:4]:
+            self._row(cl, "\u98ce\u6247:", f"{f['name']} \u2014 {f['rpm']} RPM", "#8899aa")
+        if not any_temp:
+            self._hint(cl, "\u26a0 \u65e0\u6cd5\u8bfb\u53d6\u6e29\u5ea6\u4f20\u611f\u5668\u3002\u8bf7\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd"
+                           "\u8fd0\u884c\u540e\u91cd\u8bd5\uff0c\u6216\u5b89\u88c5\u5e76\u8fd0\u884c LibreHardwareMonitor"
+                           "\uff08\u5f00\u6e90\u786c\u4ef6\u76d1\u63a7\uff09\u540e\u70b9\u51fb\u5237\u65b0\uff0c"
+                           "\u5373\u53ef\u83b7\u5f97\u7cbe\u786e\u7684 CPU/\u663e\u5361\u6e29\u5ea6\u3002")
+        self._clayout.addWidget(card)
         # Network
         adapters = info.get("network", [])
         if adapters:

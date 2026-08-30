@@ -5,7 +5,19 @@ from utils.helpers import get_drives, get_drive_info
 
 class SystemQuery(QObject):
     progress = Signal(str)
+    progress_value = Signal(int)
     finished = Signal(dict)
+
+    STEPS = 10  # total query phases, for progress bar reporting
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._step_idx = 0
+
+    def _begin_step(self, msg):
+        self._step_idx += 1
+        self.progress.emit(msg)
+        self.progress_value.emit(min(100, int(self._step_idx * 100 / self.STEPS)))
 
     def _ps(self, script):
         try:
@@ -34,11 +46,189 @@ class SystemQuery(QObject):
         except Exception:
             return ""
 
+    def _query_disk_health(self):
+        """Physical disk health & lifespan via Get-PhysicalDisk + StorageReliabilityCounter."""
+        script = (
+            "$out=Get-PhysicalDisk|ForEach-Object{$d=$_;$c=$null;"
+            "try{$c=$d|Get-StorageReliabilityCounter -ErrorAction SilentlyContinue}catch{};"
+            "[PSCustomObject]@{model=[string]$d.FriendlyName;serial=[string]$d.SerialNumber;"
+            "media=[string]$d.MediaType;bus=[string]$d.BusType;health=[string]$d.HealthStatus;"
+            "wear=$c.Wear;temp=$c.Temperature;hours=$c.PowerOnHours;read_errors=$c.ReadErrorsTotal}}"
+            "|ConvertTo-Json -Compress;$out"
+        )
+        data = self._ps(script)
+        if not data:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return []
+
+        def _num(v):
+            try:
+                return int(v) if v is not None and str(v) != "" else None
+            except (TypeError, ValueError):
+                return None
+
+        disks = []
+        for d in data:
+            if not isinstance(d, dict):
+                continue
+            disks.append({
+                "model": d.get("model", "") or "",
+                "media": d.get("media", "") or "Unspecified",
+                "bus": d.get("bus", "") or "",
+                "health": d.get("health", "") or "Unknown",
+                "wear": _num(d.get("wear")),
+                "temperature": _num(d.get("temp")),
+                "power_on_hours": _num(d.get("hours")),
+                "read_errors": _num(d.get("read_errors")),
+            })
+        return disks
+
+    def _query_nvidia_temps(self):
+        """NVIDIA GPU temperature/load/VRAM via nvidia-smi (if driver installed)."""
+        out = []
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=8, creationflags=subprocess.CREATE_NO_WINDOW)
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        t = float(parts[1])
+                    except ValueError:
+                        continue
+                    load = ""
+                    if len(parts) > 2 and parts[2]:
+                        load = parts[2].rstrip("%")
+                    mem_bytes = 0
+                    if len(parts) > 3 and parts[3].replace(".", "").isdigit():
+                        try:
+                            mem_bytes = int(float(parts[3]) * 1048576)  # MiB -> bytes
+                        except ValueError:
+                            mem_bytes = 0
+                    out.append({"name": parts[0] or "NVIDIA GPU", "temp": t,
+                                "load": load, "mem_bytes": mem_bytes})
+        except Exception:
+            pass
+        return out
+
+    def _query_monitor(self, gpu_names=None):
+        """CPU/GPU temperatures, fans and CPU load.
+
+        Priority: LibreHardwareMonitor/OpenHardwareMonitor WMI (best, needs the
+        app running) -> nvidia-smi (NVIDIA GPUs) -> ACPI thermal zone (CPU only,
+        often needs admin). Returns None fields gracefully when unavailable.
+        """
+        result = {
+            "cpu_temp": None, "cpu_temp_source": "", "cpu_load": None,
+            "gpus": [], "fans": [], "sensor_source": "",
+        }
+        try:
+            import psutil
+            result["cpu_load"] = int(psutil.cpu_percent(interval=0.3))
+        except Exception:
+            pass
+
+        # 1) LibreHardwareMonitor / OpenHardwareMonitor sensors
+        sensors = self._ps(
+            "$s=Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor "
+            "-ErrorAction SilentlyContinue;"
+            "if(-not $s){$s=Get-CimInstance -Namespace root/OpenHardwareMonitor "
+            "-ClassName Sensor -ErrorAction SilentlyContinue};"
+            "if($s){$s|Select-Object Name,SensorType,Value|ConvertTo-Json -Compress}else{''}"
+        )
+        if isinstance(sensors, dict):
+            sensors = [sensors]
+        parsed = []
+        if isinstance(sensors, list):
+            for s in sensors:
+                try:
+                    parsed.append((str(s.get("Name", "")), str(s.get("SensorType", "")),
+                                   float(s.get("Value"))))
+                except (TypeError, ValueError):
+                    continue
+
+        temps = [(n, v) for n, st, v in parsed if st == "Temperature"]
+        if temps:
+            result["sensor_source"] = "LibreHardwareMonitor"
+            for pref in ("cpu package", "tctl/tdie", "core (tctl", "cpu (tctl", "cpu"):
+                for n, v in temps:
+                    if n.lower().startswith(pref):
+                        result["cpu_temp"] = v
+                        result["cpu_temp_source"] = "LibreHardwareMonitor"
+                        break
+                if result["cpu_temp"] is not None:
+                    break
+        lhm_gpu_temps = [v for n, v in temps
+                         if n.lower().startswith("gpu")
+                         and ("core" in n.lower() or "chip" in n.lower() or n.lower() == "gpu")]
+
+        # 2) GPU list from Win32_VideoController, temps from nvidia-smi then LHM
+        gpus = [{"name": n or "GPU", "temp": None, "load": "", "source": "", "mem_bytes": 0}
+                for n in (gpu_names or [])]
+        for ng in self._query_nvidia_temps():
+            target = None
+            for g in gpus:
+                if g["temp"] is None and "nvidia" in g["name"].lower():
+                    target = g
+                    break
+            if target is None:
+                target = {"name": ng["name"], "temp": None, "load": "", "source": "", "mem_bytes": 0}
+                gpus.append(target)
+            target["temp"] = ng["temp"]
+            target["load"] = ng.get("load", "")
+            target["mem_bytes"] = ng.get("mem_bytes", 0)
+            target["source"] = "nvidia-smi"
+        gi = 0
+        for g in gpus:
+            if g["temp"] is None and gi < len(lhm_gpu_temps):
+                g["temp"] = lhm_gpu_temps[gi]
+                g["source"] = result["sensor_source"]
+                gi += 1
+        if not gpus and lhm_gpu_temps:
+            for t in lhm_gpu_temps:
+                result["gpus"].append({"name": "GPU", "temp": t, "load": "",
+                                       "source": result["sensor_source"]})
+        result["gpus"] = gpus
+
+        # 3) CPU fallback: ACPI thermal zone (K*10 units), often needs admin
+        if result["cpu_temp"] is None:
+            for src, cls in (("ACPI 热区", "MSAcpi_ThermalZoneTemperature"),
+                             ("系统热区", "Win32_PerfFormattedData_Counters_ThermalZoneInformation")):
+                prop = "CurrentTemperature" if cls == "MSAcpi_ThermalZoneTemperature" else "Temperature"
+                ns = "-Namespace root/wmi " if cls == "MSAcpi_ThermalZoneTemperature" else ""
+                raw = self._ps(
+                    "$t=Get-CimInstance " + ns + "-ClassName " + cls + " "
+                    "-ErrorAction SilentlyContinue|Where-Object{$_." + prop + " -gt 0};"
+                    "if($t){[math]::Round((($t|Measure-Object -Property " + prop +
+                    " -Average).Average)/10-273.15,1)|ConvertTo-Json -Compress}else{''}"
+                )
+                try:
+                    c = float(raw)
+                    if -50 < c < 120:
+                        result["cpu_temp"] = c
+                        result["cpu_temp_source"] = src
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+        # Fans (only available from hardware monitor sensors)
+        result["fans"] = [{"name": n, "rpm": int(v)}
+                          for n, st, v in parsed if st == "Fan" and v > 0][:6]
+        return result
+
     def query_all(self):
         info = {}
 
         # ── OS ──
-        self.progress.emit("正在获取操作系统信息...")
+        self._begin_step("正在获取操作系统信息...")
         info["os"] = self._ps(
             "$os=Get-CimInstance Win32_OperatingSystem;"
             "@{name=$os.Caption;version=$os.Version;build=$os.BuildNumber;"
@@ -49,7 +239,7 @@ class SystemQuery(QObject):
         )
 
         # ── CPU ──
-        self.progress.emit("正在获取CPU信息...")
+        self._begin_step("正在获取CPU信息...")
         cpu_raw = self._ps_text(
             "$c=Get-CimInstance Win32_Processor|Select -First 1;"
             "$c.Name+'|'+$c.NumberOfCores+'|'+$c.NumberOfLogicalProcessors+'|'+"
@@ -69,7 +259,7 @@ class SystemQuery(QObject):
         }
 
         # ── Memory (detailed via WMI + psutil) ──
-        self.progress.emit("正在获取内存信息...")
+        self._begin_step("正在获取内存信息...")
         mem = {}
         try:
             import psutil
@@ -114,7 +304,7 @@ class SystemQuery(QObject):
         info["memory"] = mem
 
         # ── GPU ──
-        self.progress.emit("正在获取显卡信息...")
+        self._begin_step("正在获取显卡信息...")
         gpu_raw = self._ps_text(
             "Get-CimInstance Win32_VideoController|ForEach-Object{"
             "$_.Name+'|'+$_.AdapterRAM+'|'+$_.DriverVersion+'|'+$_.VideoModeDescription+'|'+$_.CurrentRefreshRate"
@@ -139,7 +329,7 @@ class SystemQuery(QObject):
         info["gpu"] = gpus
 
         # ── Motherboard ──
-        self.progress.emit("正在获取主板信息...")
+        self._begin_step("正在获取主板信息...")
         mb_raw = self._ps_text(
             "$b=Get-CimInstance Win32_BaseBoard|Select -First 1;"
             "$b.Manufacturer+'|'+$b.Product+'|'+$b.Version"
@@ -152,7 +342,7 @@ class SystemQuery(QObject):
         }
 
         # ── BIOS ──
-        self.progress.emit("正在获取BIOS信息...")
+        self._begin_step("正在获取BIOS信息...")
         bios = self._ps(
             "$b=Get-CimInstance Win32_BIOS;"
             "@{manufacturer=$b.Manufacturer;version=$b.SMBIOSBIOSVersion;"
@@ -165,7 +355,7 @@ class SystemQuery(QObject):
             info["bios"] = {"manufacturer": "", "version": "", "date": "", "serial": ""}
 
         # ── Disks (detailed) ──
-        self.progress.emit("正在获取磁盘信息...")
+        self._begin_step("正在获取磁盘信息...")
         disks = []
 
         # Get physical disk info
@@ -208,8 +398,27 @@ class SystemQuery(QObject):
         info["disks"] = disks
         info["physical_disks"] = phys_disks
 
+        # ── 硬盘健康 / 寿命 ──
+        self._begin_step("正在获取硬盘健康信息...")
+        info["disk_health"] = self._query_disk_health()
+
+        # ── 温度监控 ──
+        self._begin_step("正在读取温度传感器...")
+        mon = self._query_monitor([g.get("name", "") for g in info.get("gpu", [])])
+        info["monitor"] = mon
+        # AdapterRAM 是 32 位，>4GB 显存读数错误，用 nvidia-smi 的显存修正
+        for g in info.get("gpu", []):
+            gl = (g.get("name") or "").lower()
+            if g.get("vram", 0) >= 4 * 1024**3 or "nvidia" not in gl:
+                continue
+            for ng in mon.get("gpus", []):
+                mb = ng.get("mem_bytes") or 0
+                if mb and "nvidia" in (ng.get("name") or "").lower():
+                    g["vram"] = mb
+                    break
+
         # ── Network ──
-        self.progress.emit("正在获取网络信息...")
+        self._begin_step("正在获取网络信息...")
         net_raw = self._ps_text(
             "Get-CimInstance Win32_NetworkAdapter|Where-Object{$_.NetEnabled -eq $true}|ForEach-Object{"
             "$_.Name+'|'+$_.AdapterType+'|'+$_.Speed"

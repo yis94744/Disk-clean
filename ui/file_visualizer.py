@@ -7,8 +7,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QColor, QAction
 from core.scanner import ScanWorker
-from utils.helpers import get_drives, format_size, format_timestamp, get_file_extension_category
-from utils.cache import ScanCache
+from utils.helpers import get_drives, format_size, format_timestamp, get_file_extension_category, recycle_path
 from utils.themes import load_settings, size_color
 
 CAT_COLORS = {"Video":"#E91E63","Image":"#4CAF50","Audio":"#2196F3","Archive":"#9C27B0","Document":"#FF9800","Code":"#00BCD4","Program":"#F44336","System":"#FF5252","Font":"#26A69A","Mobile App":"#7C4DFF","Web/Net":"#00C853","Shortcut":"#FF5722","Other":"#888"}
@@ -39,7 +38,6 @@ class FileVisualizerPage(QWidget):
         super().__init__(parent)
         self._worker = None
         self._root = None
-        self._cache = ScanCache()
         self._all_flat_files = []
         self._loaded = False
         self._setup_ui()
@@ -49,6 +47,7 @@ class FileVisualizerPage(QWidget):
         layout.setContentsMargins(10, 10, 10, 6)
         layout.setSpacing(4)
 
+        # 第 1 行：扫描操作（左） + 过滤器（右）
         tb = QHBoxLayout()
         self.drive_combo = QComboBox(); self.drive_combo.setMinimumWidth(90)
         for d in get_drives(): self.drive_combo.addItem(d, d)
@@ -58,7 +57,6 @@ class FileVisualizerPage(QWidget):
         tb.addWidget(QLabel("磁盘:"))
         tb.addWidget(self.drive_combo)
         tb.addWidget(self.scan_btn)
-
         self.scan_all_btn = QPushButton("扫描全部")
         self.scan_all_btn.setObjectName("greenBtn")
         self.scan_all_btn.clicked.connect(self._scan_all)
@@ -82,17 +80,22 @@ class FileVisualizerPage(QWidget):
         self.search_edit.setMaximumWidth(160)
         self.search_edit.textChanged.connect(self._apply_filter)
         tb.addWidget(self.search_edit)
+        layout.addLayout(tb)
+
+        # 第 2 行：文件操作（左对齐，与扫描操作分组隔离）
+        tb2 = QHBoxLayout()
         self.open_btn = QPushButton("打开目录")
         self.open_btn.clicked.connect(self._open_selected)
-        tb.addWidget(self.open_btn)
+        tb2.addWidget(self.open_btn)
         self.del_btn = QPushButton("删除选中")
         self.del_btn.setObjectName("redBtn")
         self.del_btn.clicked.connect(self._delete_selected)
-        tb.addWidget(self.del_btn)
+        tb2.addWidget(self.del_btn)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self._rebuild_list)
-        tb.addWidget(self.refresh_btn)
-        layout.addLayout(tb)
+        tb2.addWidget(self.refresh_btn)
+        tb2.addStretch()
+        layout.addLayout(tb2)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -276,8 +279,6 @@ class FileVisualizerPage(QWidget):
         self.status_message.emit(f"扫描完成: {self.drive_combo.currentText()}")
         # Force Qt to process pending events
         self._rebuild_list()
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
     def _reset_ui(self):
         self.scan_btn.setEnabled(True)
         if hasattr(self, "scan_all_btn"):
@@ -299,31 +300,11 @@ class FileVisualizerPage(QWidget):
         self._all_flat_files = deduped
 
 
-    def _walk_tree(self, node, result):
-        """Iterative: collect files >= 1MB or code files."""
-        try:
-            stack = [node]
-            while stack:
-                n = stack.pop()
-                children = getattr(n, "children", None)
-                if children is None:
-                    continue
-                for child in children:
-                    try:
-                        if getattr(child, "is_dir", False):
-                            stack.append(child)
-                        elif getattr(child, "size", 0) >= 1048576 or getattr(child, "ext", "") in _CODE_EXTS:
-                            result.append(child)
-                    except Exception:
-                        continue
-        except Exception as e:
-            self.status_lbl.setText(f"遍历错误: {e}")
     def _apply_filter(self, *_):
         self._rebuild_list()
 
     # ---- Rebuild list ----
-    _SOFTWARE_DIRS = {
-        "google": "Google Chrome", "mozilla firefox": "Mozilla Firefox",
+    _SOFTWARE_DIRS = {        "google": "Google Chrome", "mozilla firefox": "Mozilla Firefox",
         "microsoft edge": "Microsoft Edge", "opera": "Opera Browser",
         "360": "360安全", "tencent": "腾讯",
         "qq": "QQ", "wechat": "微信", "wxwork": "企业微信",
@@ -472,9 +453,7 @@ class FileVisualizerPage(QWidget):
                 item.setData(0, Qt.UserRole, child)
                 self.file_tree.addTopLevelItem(item)
                 count += 1
-                if count % 100 == 0:
-                    from PySide6.QtWidgets import QApplication
-                    QApplication.processEvents()
+                # 不调用 processEvents：重建期间处理输入事件会导致导航重入卡顿
             except:
                 continue
 
@@ -523,18 +502,14 @@ class FileVisualizerPage(QWidget):
         if len(td) > 10:
             names += chr(10) + "... 还有 " + str(len(td)-10) + " 个"
         r = QMessageBox.warning(self, "确认删除",
-            "确定要删除以下文件吗？\n\n" + names + "\n\n此操作不可撤销！",
+            "以下文件将移入回收站：\n\n" + names + "\n\n确定继续？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes: return
         cleaned = 0; failed = 0
         for node, _ in td:
-            try:
-                if _os.path.exists(node.path):
-                    _os.remove(node.path)
-                    cleaned += 1
-            except:
-                failed += 1
-        msg = "已删除 " + str(cleaned) + " 个"
+            if recycle_path(node.path): cleaned += 1
+            else: failed += 1
+        msg = "已移入回收站 " + str(cleaned) + " 个"
         if failed: msg += " (" + str(failed) + " 失败)"
         self.status_message.emit(msg)
         self.status_lbl.setText(msg)

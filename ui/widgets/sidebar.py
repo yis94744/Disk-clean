@@ -9,12 +9,16 @@ import math as _m
 NAV_ITEMS = [
     ("dashboard", "仪表盘"),
     ("file_visualizer", "文件可视化"),
+    ("quick_search", "极速搜索"),
+    ("disk_analyzer", "磁盘分析"),
     ("safe_cleaner", "安全清理"),
+    ("c_cleaner", "C盘专清"),
     ("software_mgr", "软件管理"),
     ("dup_finder", "重复文件"),
     ("large_files", "大文件"),
     ("startup_mgr", "启动管理"),
     ("process_mgr", "进程管理"),
+    ("driver_mgr", "驱动检测"),
     ("system_info", "系统信息"),
     ("settings", "设置"),
 ]
@@ -22,12 +26,16 @@ NAV_ITEMS = [
 _CARTOON_COLORS = {
     "dashboard": ("#FF6B8A", "#FF8FAB"),
     "file_visualizer": ("#FFB347", "#FFC978"),
+    "quick_search": ("#4ADE80", "#86EFAC"),
+    "disk_analyzer": ("#4DD0E1", "#80DEEA"),
+    "c_cleaner": ("#C792EA", "#E1BEE7"),
     "safe_cleaner": ("#4ECDC4", "#7EDDD6"),
     "software_mgr": ("#A78BFA", "#C4B5FD"),
     "dup_finder": ("#60A5FA", "#93C5FD"),
     "large_files": ("#F87171", "#FCA5A5"),
     "startup_mgr": ("#34D399", "#6EE7B7"),
     "process_mgr": ("#FBBF24", "#FCD34D"),
+    "driver_mgr": ("#FB923C", "#FDBA74"),
     "system_info": ("#818CF8", "#A5B4FC"),
     "settings": ("#9CA3AF", "#D1D5DB"),
 }
@@ -64,6 +72,28 @@ def _make_cartoon_icon(key, size=28):
         p.drawLine(QPointF(cx-2, cy), QPointF(cx+2, cy))
         p.drawLine(QPointF(cx, cy-2), QPointF(cx, cy+2))
         p.setOpacity(1.0)
+    if key == "c_cleaner":
+        # "C" 字母图标 + 小扫帚斜线
+        p.setPen(QPen(QColor(c1), 3))
+        p.drawArc(QRectF(m + 2, m + 1, s - 2 * m - 4, s - 2 * m - 6), 30 * 16, 285 * 16)
+        p.setPen(QPen(QColor(c2), 2))
+        p.drawLine(QPointF(m + 4, s - m - 3), QPointF(s - m - 4, m + 3))
+    if key == "quick_search":
+        # 放大镜：圆环 + 斜柄
+        pen = QPen(QColor(c1), 3)
+        p.setPen(pen)
+        p.drawEllipse(QRectF(m + 2, m + 2, s - 2 * m - 8, s - 2 * m - 8))
+        p.setPen(QPen(QColor(c2), 4))
+        p.drawLine(QPointF(s - m - 5, s - m - 5), QPointF(s - m, s - m))
+    if key == "disk_analyzer":
+        # treemap 风格：四个大小不一的色块
+        p.setBrush(QBrush(QColor(c1))); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(m, m, s * 0.55 - 1, s * 0.55 - 1), 2, 2)
+        p.setBrush(QBrush(QColor(c2)))
+        p.drawRoundedRect(QRectF(m + s * 0.55 + 1, m, s * 0.45 - m - 1, s * 0.35 - 1), 2, 2)
+        p.drawRoundedRect(QRectF(m, m + s * 0.55 + 1, s * 0.35 - 1, s * 0.45 - m - 1), 2, 2)
+        p.setBrush(QBrush(QColor(c1)))
+        p.drawRoundedRect(QRectF(m + s * 0.35 + 1, m + s * 0.55 + 1, s * 0.65 - m - 1, s * 0.45 - m - 1), 2, 2)
     if key == "safe_cleaner":
         p.setBrush(QBrush(QColor(c1))); p.setPen(Qt.NoPen)
         path = QPainterPath()
@@ -130,6 +160,21 @@ def _make_cartoon_icon(key, size=28):
         p.setBrush(QBrush(QColor("#FFFFFF"))); p.setOpacity(0.6)
         p.drawEllipse(QPointF(m+8, s-m-9), 1.5, 1.5)
         p.drawEllipse(QPointF(m+13, s-m-9), 1.2, 1.2); p.setOpacity(1.0)
+    if key == "driver_mgr":
+        # 芯片图标：本体 + 四边引脚 + 中心小方块
+        p.setBrush(QBrush(QColor(c1))); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(m + 3, m + 3, s - 2 * m - 6, s - 2 * m - 6), 2, 2)
+        p.setPen(QPen(QColor(c2), 2))
+        for i in range(3):
+            off = m + 5 + i * 6
+            p.drawLine(QPointF(off, m), QPointF(off, m + 3))
+            p.drawLine(QPointF(off, s - m), QPointF(off, s - m - 3))
+            p.drawLine(QPointF(m, off), QPointF(m + 3, off))
+            p.drawLine(QPointF(s - m, off), QPointF(s - m - 3, off))
+        p.setBrush(QBrush(QColor("#FFFFFF"))); p.setOpacity(0.65)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(m + 8, m + 8, 6, 6), 1, 1)
+        p.setOpacity(1.0)
     if key == "system_info":
         p.setBrush(QBrush(QColor(c1))); p.setPen(Qt.NoPen)
         p.drawRoundedRect(QRectF(m, m-1, s-2*m, s-2*m-6), 3, 3)
@@ -167,6 +212,7 @@ class AnimatedNavButton(QPushButton):
         self._nav_key = nav_key
         self._anim_progress = 0.0
         self._is_checked = False
+        self._accent = QColor(100, 140, 255)
         self.setIcon(icon)
         self.setIconSize(QSize(24, 24))
         self.setCursor(Qt.PointingHandCursor)
@@ -192,6 +238,12 @@ class AnimatedNavButton(QPushButton):
         self.update()
 
     anim_progress = Property(float, _get_anim_progress, _set_anim_progress)
+
+    def set_accent_color(self, color):
+        if isinstance(color, str):
+            color = QColor(color)
+        self._accent = QColor(color)
+        self.update()
 
     def enterEvent(self, event: QEnterEvent):
         if not self._is_checked:
@@ -222,11 +274,11 @@ class AnimatedNavButton(QPushButton):
         t = self._anim_progress
 
         if self._is_checked:
-            bg_color = QColor(100, 140, 255, int(40 + t * 20))
-            accent_color = QColor(100, 140, 255, int(180 + t * 75))
+            bg_color = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), int(40 + t * 20))
+            accent_color = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), int(180 + t * 75))
         else:
-            bg_color = QColor(100, 140, 255, int(t * 25))
-            accent_color = QColor(100, 140, 255, int(t * 40))
+            bg_color = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), int(t * 25))
+            accent_color = QColor(self._accent.red(), self._accent.green(), self._accent.blue(), int(t * 40))
 
         p.setBrush(QBrush(bg_color))
         p.setPen(Qt.NoPen)
@@ -331,3 +383,8 @@ class Sidebar(QFrame):
     def set_active(self, key):
         for k, btn in self.buttons.items():
             btn.set_checked(k == key)
+
+    def set_accent(self, color):
+        """Theme accent for selection/hover highlight (QColor or hex string)."""
+        for btn in self.buttons.values():
+            btn.set_accent_color(color)

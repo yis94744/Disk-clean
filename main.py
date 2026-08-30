@@ -3,45 +3,75 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout, QStackedWidget, QStatusBar,
-    QLabel, QFrame, QPushButton)
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+    QLabel, QFrame, QPushButton, QSystemTrayIcon, QMenu, QGraphicsOpacityEffect)
+from PySide6.QtCore import Qt, QTimer, QEvent, QObject, QPropertyAnimation, QEasingCurve, QAbstractAnimation
+from PySide6.QtGui import QFont, QAction
 from ui.widgets.sidebar import Sidebar
 from ui.dashboard import DashboardPage
 from ui.file_visualizer import FileVisualizerPage
+from ui.disk_analyzer import DiskAnalyzerPage
 from ui.safe_cleaner import SafeCleanerPage
+from ui.c_disk_cleaner import CDiskCleanerPage
 from ui.software_mgr import SoftwareManagerPage
 from ui.dup_finder import DupFinderPage
 from ui.large_files import LargeFilesPage
 from ui.startup_mgr import StartupManagerPage
 from ui.process_mgr import ProcessManagerPage
+from ui.driver_mgr import DriverMgrPage
+from ui.quick_search import QuickSearchPage
 from ui.system_info import SystemInfoPage
 from ui.settings import SettingsPage
 from utils.helpers import is_admin, get_drive_info
-from utils.themes import build_stylesheet, build_sidebar_style, load_settings
+from utils.themes import build_stylesheet, build_sidebar_style, load_settings, get_theme
 from utils.constants import APP_NAME
 
 def _load_theme():
     s = load_settings()
-    return build_stylesheet(s.get('theme', 'deep'))
+    return build_stylesheet(s.get('theme', 'green'))
 
 THEME = _load_theme()
 
 PAGE_CLASSES = {
-    "dashboard": DashboardPage, "file_visualizer": FileVisualizerPage, "safe_cleaner": SafeCleanerPage,
-    "software_mgr": SoftwareManagerPage, "dup_finder": DupFinderPage,
+    "dashboard": DashboardPage, "file_visualizer": FileVisualizerPage,
+    "quick_search": QuickSearchPage,
+    "disk_analyzer": DiskAnalyzerPage, "safe_cleaner": SafeCleanerPage,
+    "c_cleaner": CDiskCleanerPage, "software_mgr": SoftwareManagerPage,
+    "dup_finder": DupFinderPage,
     "large_files": LargeFilesPage, "startup_mgr": StartupManagerPage,
-    "process_mgr": ProcessManagerPage, "system_info": SystemInfoPage,
+    "process_mgr": ProcessManagerPage, "driver_mgr": DriverMgrPage,
+    "system_info": SystemInfoPage,
     "settings": SettingsPage,
 }
 
 PAGE_TITLES = {
-    "dashboard": "仪表盘", "file_visualizer": "文件可视化", "safe_cleaner": "安全清理",
-    "software_mgr": "软件管理", "dup_finder": "重复文件",
+    "dashboard": "仪表盘", "file_visualizer": "文件可视化", "quick_search": "极速搜索", "disk_analyzer": "磁盘分析",
+    "safe_cleaner": "安全清理", "c_cleaner": "C盘专清", "software_mgr": "软件管理", "dup_finder": "重复文件",
     "large_files": "大文件", "startup_mgr": "启动管理",
-    "process_mgr": "进程管理", "system_info": "系统信息",
+    "process_mgr": "进程管理", "driver_mgr": "驱动检测", "system_info": "系统信息",
     "settings": "设置",
 }
+
+
+def _repolish(w):
+    st = w.style()
+    st.unpolish(w)
+    st.polish(w)
+
+
+class _ButtonGlow(QObject):
+    """全局按钮点击动效：按下发光描边，松开恢复（配合 QSS :pressed 下沉）。"""
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if isinstance(obj, QPushButton) and obj.isEnabled():
+            if et == QEvent.MouseButtonPress:
+                obj.setProperty("pressGlow", True)
+                _repolish(obj)
+            elif et in (QEvent.MouseButtonRelease, QEvent.Hide):
+                if obj.property("pressGlow"):
+                    obj.setProperty("pressGlow", False)
+                    _repolish(obj)
+        return False
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -53,10 +83,15 @@ class MainWindow(QMainWindow):
         self._current_key = ""
         self._pending_timer = None
         self._navigating = False
+        self._pending_nav_key = ""
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setSingleShot(True)
+        self._nav_timer.timeout.connect(self._do_navigate)
         self._setup_ui()
         self._setup_statusbar()
         self.setStyleSheet(THEME)
         self._apply_background()
+        self._setup_tray()
 
     def _set_app_icon(self):
         import os, sys
@@ -77,8 +112,10 @@ class MainWindow(QMainWindow):
         hl = QHBoxLayout(cw)
         hl.setContentsMargins(0, 0, 0, 0); hl.setSpacing(0)
         self.sidebar = Sidebar()
-        sbs = build_sidebar_style(load_settings().get("theme", "deep"))
+        theme_name = load_settings().get("theme", "green")
+        sbs = build_sidebar_style(theme_name)
         self.sidebar.setStyleSheet(sbs)
+        self.sidebar.set_accent(get_theme(theme_name)["accent"])
         self.sidebar.nav_clicked.connect(self._navigate)
         hl.addWidget(self.sidebar)
         rp = QFrame(); rp.setObjectName("rightPanel")
@@ -132,19 +169,29 @@ class MainWindow(QMainWindow):
         except Exception: pass
 
     def _navigate(self, key):
-        # Ignore if already navigating or same page
-        if self._navigating:
-            return
+        """合并连续导航点击：只记录最新请求，事件循环空闲时执行最后一次。
+
+        首次进入某页会在 UI 线程同步构造页面（数十至数百毫秒），连点期间
+        被阻塞的点击会排队并在解除阻塞后逐个补执行，造成长时间卡顿；
+        合并后无论点多少下都只切换到最后一页。"""
         if key == self._current_key:
             return
-        
+        self._pending_nav_key = key
+        self._nav_timer.start(0)
+
+    def _do_navigate(self):
+        key = self._pending_nav_key
+        self._pending_nav_key = ""
+        if not key or key == self._current_key:
+            return
+
         self._navigating = True
         try:
             # Cancel any pending deferred load
             if self._pending_timer and self._pending_timer.isActive():
                 self._pending_timer.stop()
                 self._pending_timer = None
-            
+
             # Hide old page
             if self._current_key and self._current_key in self._pages:
                 old = self._pages[self._current_key]
@@ -165,6 +212,8 @@ class MainWindow(QMainWindow):
                             page.status_message.connect(self._status_lbl.setText)
                         if hasattr(page, "theme_changed"):
                             page.theme_changed.connect(self._apply_theme)
+                        if hasattr(page, "action_requested"):
+                            page.action_requested.connect(self._on_page_action)
                     except Exception as e:
                         print(f"Error creating page {key}: {e}")
                         return
@@ -175,16 +224,36 @@ class MainWindow(QMainWindow):
                     self.stack.setCurrentWidget(w)
                     self._current_key = key
                     self.sidebar.set_active(key)
-                    
-                    # Deferred activation: wait for UI to settle
+                    self._fade_in(w)
+
+                    # Deferred activation: short settle wait (50ms) keeps first paint snappy
                     self._pending_timer = QTimer()
                     self._pending_timer.setSingleShot(True)
                     self._pending_timer.timeout.connect(
                         lambda k=key: self._activate_page(k)
                     )
-                    self._pending_timer.start(200)
+                    self._pending_timer.start(50)
         finally:
             self._navigating = False
+
+    def _fade_in(self, w):
+        """页面切换淡入动效。"""
+        try:
+            if w.graphicsEffect():
+                w.setGraphicsEffect(None)
+            eff = QGraphicsOpacityEffect(w)
+            eff.setOpacity(0.35)
+            w.setGraphicsEffect(eff)
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(180)
+            anim.setStartValue(0.35)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.finished.connect(lambda ww=w: ww.setGraphicsEffect(None))
+            anim.start(QAbstractAnimation.DeleteWhenStopped)
+            self._fade_anim = anim
+        except Exception:
+            pass
 
 
     def _apply_background(self):
@@ -201,17 +270,80 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, theme_name):
         """Apply theme live when settings change"""
-        from utils.themes import build_stylesheet, build_sidebar_style
+        from utils.themes import build_stylesheet, build_sidebar_style, get_theme
         ss = build_stylesheet(theme_name)
         self.setStyleSheet(ss)
         sbs = build_sidebar_style(theme_name)
         self.sidebar.setStyleSheet(sbs)
+        self.sidebar.set_accent(get_theme(theme_name)["accent"])
+        # 页面级主题色（面板底色等）同步刷新
+        for page in self._pages.values():
+            if hasattr(page, "update_theme_styles"):
+                try:
+                    page.update_theme_styles()
+                except Exception:
+                    pass
 
     def _activate_page(self, key):
         if key in self._pages and key == self._current_key:
             page = self._pages[key]
             if hasattr(page, "_set_visible"):
                 page._set_visible(True)
+
+    def _on_page_action(self, action):
+        """Quick-action buttons from the dashboard."""
+        if action == "scan_all":
+            self._navigate("file_visualizer")
+            page = self._pages.get("file_visualizer")
+            if page: QTimer.singleShot(400, page._scan_all)
+        elif action == "smart_clean":
+            self._navigate("safe_cleaner")
+            page = self._pages.get("safe_cleaner")
+            if page: QTimer.singleShot(400, page._analyze)
+
+    def _setup_tray(self):
+        self._tray = None
+        self._force_quit = False
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            return
+        tray = QSystemTrayIcon(icon, self)
+        menu = QMenu()
+        act_show = QAction("显示主窗口", self)
+        act_show.triggered.connect(self._restore_from_tray)
+        act_exit = QAction("退出", self)
+        act_exit.triggered.connect(self._really_quit)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_exit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda reason: self._restore_from_tray()
+            if reason == QSystemTrayIcon.DoubleClick else None)
+        tray.setToolTip(APP_NAME)
+        tray.show()
+        self._tray = tray
+
+    def _restore_from_tray(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.activateWindow()
+
+    def _really_quit(self):
+        self._force_quit = True
+        if self._tray:
+            self._tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if (self._tray and not self._force_quit
+                and load_settings().get("minimize_to_tray", False)):
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(APP_NAME, "已最小化到托盘，双击图标恢复",
+                                   QSystemTrayIcon.Information, 2000)
 
 def main():
     app = QApplication(sys.argv)
@@ -220,6 +352,7 @@ def main():
     import warnings
     warnings.filterwarnings("ignore", category=DeprecationWarning)
     w = MainWindow(); w.show()
+    app.installEventFilter(_ButtonGlow(app))
     QTimer.singleShot(100, lambda: w._navigate("dashboard"))
     sys.exit(app.exec())
 

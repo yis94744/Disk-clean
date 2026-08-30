@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QSpinBox, QMessageBox, QApplication, QMenu)
 from PySide6.QtCore import Signal, QTimer, QThread, QObject, Qt
 from PySide6.QtGui import QFont, QColor, QAction
-from utils.helpers import format_size, get_drives, get_file_extension_category
+from utils.helpers import format_size, get_drives, get_file_extension_category, recycle_path
 
 # Refined categories with more granular types
 CAT_NAMES = {
@@ -18,6 +18,8 @@ CAT_NAMES = {
     "Database":"\u6570\u636e\u5e93", "Font":"\u5b57\u4f53", "Temp":"\u4e34\u65f6\u6587\u4ef6",
     "Shortcut":"\u5feb\u6377\u65b9\u5f0f", "Certificate":"\u8bc1\u4e66/\u5bc6\u94a5",
     "VirtualDisk":"\u865a\u62df\u78c1\u76d8", "Backup":"\u5907\u4efd\u6587\u4ef6",
+    "System":"\u7cfb\u7edf\u9a71\u52a8", "Program":"\u5b89\u88c5\u7a0b\u5e8f",
+    "Mobile App":"\u79fb\u52a8\u5e94\u7528", "Web/Net":"\u7f51\u7edc/\u7f51\u9875",
     "Other":"\u5176\u4ed6",
 }
 CAT_COLORS = {
@@ -135,11 +137,14 @@ class LargeFilesPage(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self); layout.setContentsMargins(12,12,12,12); layout.setSpacing(8)
-        tb = QHBoxLayout()
+        layout = QVBoxLayout(self); layout.setContentsMargins(12,12,12,8); layout.setSpacing(8)
+        # 第 1 行：标题（左）
+        tb0 = QHBoxLayout()
         t = QLabel("\u5927\u6587\u4ef6\u67e5\u627e")
-        t.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
-        t.setStyleSheet("color: #e0e0e0;"); tb.addWidget(t); tb.addStretch()
+        t.setObjectName("pageTitle"); tb0.addWidget(t); tb0.addStretch()
+        layout.addLayout(tb0)
+        # 第 2 行：扫描条件（左） + 扫描操作（右）
+        tb = QHBoxLayout()
         self.dc = QComboBox()
         for d in get_drives(): self.dc.addItem(d, d)
         tb.addWidget(QLabel("\u78c1\u76d8:")); tb.addWidget(self.dc)
@@ -151,17 +156,22 @@ class LargeFilesPage(QWidget):
         for en, cn in CAT_NAMES.items(): self.cat_combo.addItem(cn, en)
         self.cat_combo.currentIndexChanged.connect(self._apply_filter)
         tb.addWidget(self.cat_combo)
+        tb.addStretch()
         self.scan_btn = QPushButton("\u5f00\u59cb\u626b\u63cf")
         self.scan_btn.setObjectName("greenBtn")
         self.scan_btn.clicked.connect(self._scan); tb.addWidget(self.scan_btn)
         self.cancel_btn = QPushButton("\u53d6\u6d88"); self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(self._cancel); tb.addWidget(self.cancel_btn)
+        layout.addLayout(tb)
+        # 第 3 行：文件操作（左对齐）
+        tb2 = QHBoxLayout()
         self.open_btn = QPushButton("\u6253\u5f00\u76ee\u5f55"); self.open_btn.clicked.connect(self._open_selected)
-        tb.addWidget(self.open_btn)
+        tb2.addWidget(self.open_btn)
         self.del_btn = QPushButton("\u5220\u9664\u9009\u4e2d")
         self.del_btn.setObjectName("redBtn")
-        self.del_btn.clicked.connect(self._delete_selected); tb.addWidget(self.del_btn)
-        layout.addLayout(tb)
+        self.del_btn.clicked.connect(self._delete_selected); tb2.addWidget(self.del_btn)
+        tb2.addStretch()
+        layout.addLayout(tb2)
         self.progress = QProgressBar(); self.progress.setVisible(False); layout.addWidget(self.progress)
         self.slbl = QLabel("\u9009\u62e9\u78c1\u76d8\u5e76\u70b9\u51fb\u626b\u63cf")
         self.slbl.setStyleSheet("color: #888;"); layout.addWidget(self.slbl)
@@ -272,17 +282,16 @@ class LargeFilesPage(QWidget):
             QMessageBox.information(self, "\u63d0\u793a", "\u8bf7\u5148\u9009\u62e9\u8981\u5220\u9664\u7684\u6587\u4ef6")
             return
         names = chr(10).join(fn for fn, _ in td[:10])
-        if len(td) > 10: names += chr(10) + f"...  {len(td)-10} \u4e2a"
-        r = QMessageBox.warning(self, "\u786e\u8ba4\u5220\u9664",
-            "\u786e\u5b9a\u8981\u5220\u9664\u4ee5\u4e0b\u6587\u4ef6\u5417\uff1f\n\n" + names,
+        if len(td) > 10: names += chr(10) + f"...  {len(td)-10} 个"
+        r = QMessageBox.warning(self, "确认删除",
+            "以下文件将移入回收站：\n\n" + names,
             QMessageBox.Yes|QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes: return
         cleaned = 0; failed = 0
         for fp, _ in td:
-            try:
-                if _os.path.exists(fp): _os.remove(fp); cleaned += 1
-            except: failed += 1
-        msg = f"  {cleaned} \u4e2a"
-        if failed: msg += f", {failed} \u5931\u8d25"
+            if recycle_path(fp): cleaned += 1
+            else: failed += 1
+        msg = f"已移入回收站 {cleaned} 个"
+        if failed: msg += f", {failed} 失败"
         self.status_message.emit(msg)
         QMessageBox.information(self, "\u7ed3\u679c", msg)

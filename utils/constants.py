@@ -13,10 +13,10 @@ CAUTION = 2
 PROTECTED = 3
 
 SAFETY_LABELS = {
-    SAFE: ("Safe", "#4CAF50", "green"),
-    SUGGESTED: ("Clean", "#FF9800", "yellow"),
-    CAUTION: ("Caution", "#FF5722", "orange"),
-    PROTECTED: ("Protected", "#F44336", "red"),
+    SAFE: ("安全", "#4CAF50", "green"),
+    SUGGESTED: ("建议清理", "#FF9800", "yellow"),
+    CAUTION: ("谨慎", "#FF5722", "orange"),
+    PROTECTED: ("受保护", "#F44336", "red"),
 }
 
 SAFETY_STYLESHEET = {

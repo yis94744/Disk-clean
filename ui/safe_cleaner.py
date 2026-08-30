@@ -35,6 +35,23 @@ class CleanerWorker(QThread):
         self.engine.analyze(self.items)
 
 
+class CleanWorker(QThread):
+    """后台执行 engine.clean，避免清理期间冻结 UI。"""
+    clean_finished = Signal(list)
+
+    def __init__(self, engine, items):
+        super().__init__()
+        self.engine = engine
+        self.items = items
+
+    def run(self):
+        try:
+            results = self.engine.clean(self.items)
+        except Exception as e:
+            results = [{"name": "清理异常", "freed_size": 0, "errors": [str(e)], "success": False}]
+        self.clean_finished.emit(results)
+
+
 class SafeCleanerPage(QWidget):
     status_message = Signal(str)
 
@@ -54,8 +71,7 @@ class SafeCleanerPage(QWidget):
         # Toolbar
         tb = QHBoxLayout()
         title = QLabel("安全清理")
-        title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
-        title.setStyleSheet("color: #e0e0e0;")
+        title.setObjectName("pageTitle")
         tb.addWidget(title)
         tb.addStretch()
 
@@ -197,10 +213,35 @@ class SafeCleanerPage(QWidget):
         )
         if r != QMessageBox.Yes:
             return
-        results = self._engine.clean(selected)
+        # 后台线程执行清理，完成后在 _on_clean_finished 恢复按钮并汇总
+        self.clean_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
+        self.slbl.setText("清理中... (0/" + str(len(selected)) + ")")
+        self._clean_worker = CleanWorker(self._engine, selected)
+        self._clean_worker.clean_finished.connect(self._on_clean_finished)
+        self._clean_worker.start()
+
+    def _on_clean_finished(self, results):
+        self.clean_btn.setEnabled(True)
+        self.analyze_btn.setEnabled(True)
         freed = sum(r2["freed_size"] for r2 in results)
-        self.total.setText("清理完成! 释放 " + format_size(freed))
+        failed = sum(1 for r2 in results if not r2["success"])
+        msg = "清理完成! 释放 " + format_size(freed)
+        if failed:
+            msg += "（" + str(failed) + " 项有跳过的文件）"
+        self.total.setText(msg)
+        self.slbl.setText(msg)
         self.status_message.emit("清理完成: 释放 " + format_size(freed))
+        # 刷新各条目大小为 0（已清理）
+        for i in range(self.tree.topLevelItemCount()):
+            ti = self.tree.topLevelItem(i)
+            it = ti.data(0, Qt.UserRole)
+            if it and ti.checkState(0) == Qt.Checked:
+                it.size = 0
+                it.file_count = 0
+                ti.setText(2, format_size(0))
+                ti.setText(4, "0")
+                ti.setText(5, "已清理")
 
     def _scan_reg(self):
         self.reg_tree.clear()
@@ -255,7 +296,7 @@ class SafeCleanerPage(QWidget):
                 iss = item.data(0, Qt.UserRole)
                 if iss:
                     try:
-                        if RegistryScanner.clean_issue(None, iss):
+                        if RegistryScanner.clean_issue(iss):
                             cleaned += 1
                             item.setHidden(True)
                         else:

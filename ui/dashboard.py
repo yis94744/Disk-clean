@@ -9,6 +9,7 @@ from utils.themes import size_color
 
 class DashboardPage(QWidget):
     status_message = Signal(str)
+    action_requested = Signal(str)  # "scan_all" | "smart_clean"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -20,19 +21,24 @@ class DashboardPage(QWidget):
             self._first_load = False
             QTimer.singleShot(100, self._refresh)
 
+    def update_theme_styles(self):
+        from utils.themes import panel_qss
+        self._panel.setStyleSheet(panel_qss())
+
     def _setup_ui(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
         main = QWidget()
-        main.setStyleSheet("background:rgba(20,20,40,0.50);border-radius:10px;")
+        from utils.themes import panel_qss
+        self._panel = main
+        main.setStyleSheet(panel_qss())
         layout = QVBoxLayout(main)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(20)
 
         title = QLabel("仪表盘")
-        title.setFont(QFont("Microsoft YaHei", 20, QFont.Bold))
-        title.setStyleSheet("color:#e0e0e0;")
+        title.setObjectName("pageTitle")
         layout.addWidget(title)
 
         top = QHBoxLayout()
@@ -51,9 +57,11 @@ class DashboardPage(QWidget):
         qb = QHBoxLayout()
         sb = QPushButton("扫描所有磁盘")
         sb.setObjectName("greenBtn")
+        sb.clicked.connect(lambda: self.action_requested.emit("scan_all"))
         qb.addWidget(sb)
         cb = QPushButton("智能清理")
         cb.setObjectName("greenBtn")
+        cb.clicked.connect(lambda: self.action_requested.emit("smart_clean"))
         qb.addWidget(cb)
         qb.addStretch()
         ql.addLayout(qb)

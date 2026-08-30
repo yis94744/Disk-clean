@@ -1,7 +1,7 @@
 """
 Utility helpers for Disk Cleaner Pro
 """
-import os, ctypes, sys, string
+import os, ctypes, sys, string, subprocess
 from datetime import datetime
 
 def format_size(size_bytes) -> str:
@@ -41,6 +41,68 @@ def run_as_admin():
     if not is_admin():
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
         sys.exit(0)
+
+def recycle_path(path: str) -> bool:
+    """Move a file or directory to the Recycle Bin instead of permanent delete."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        p = str(path).replace("'", "''")
+        kind = "DeleteDirectory" if os.path.isdir(path) else "DeleteFile"
+        script = ("Add-Type -AssemblyName Microsoft.VisualBasic;"
+                  f"[Microsoft.VisualBasic.FileIO.FileSystem]::{kind}('{p}',"
+                  "'OnlyErrorDialogs','SendToRecycleBin')")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                           capture_output=True, timeout=120,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        return r.returncode == 0 and not os.path.exists(path)
+    except Exception:
+        return False
+
+AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "DiskCleanerPro"
+
+def set_auto_start(enable: bool) -> bool:
+    """Toggle launch-on-startup via HKCU Run. Returns success."""
+    try:
+        import winreg
+        if enable:
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}"'
+            else:
+                main_py = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+                cmd = f'"{sys.executable}" "{main_py}"'
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0, winreg.KEY_SET_VALUE)
+            try:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+            finally:
+                winreg.CloseKey(key)
+        else:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0, winreg.KEY_SET_VALUE)
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                finally:
+                    winreg.CloseKey(key)
+            except OSError:
+                pass
+        return True
+    except Exception:
+        return False
+
+def get_auto_start() -> bool:
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY)
+        try:
+            winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return True
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return False
+    except Exception:
+        return False
 
 def get_drives() -> list:
     drives = []

@@ -10,7 +10,7 @@ from PySide6.QtCore import QFileInfo
 from PySide6.QtWidgets import QFileIconProvider
 from PySide6.QtGui import QFont, QIcon, QPixmap, QColor, QPainter, QPen, QBrush, QPalette
 from core.uninstaller import UninstallWorker, UninstallExecutor
-from utils.helpers import format_size, get_drives
+from utils.helpers import format_size, get_drives, recycle_path
 
 KNOWN_SOFTWARE = {
     "google chrome": "Google Chrome - Fast, secure web browser by Google",
@@ -454,19 +454,19 @@ class SoftwareManagerPage(QWidget):
         self._setup_ui(); QTimer.singleShot(200, self._load)
 
     def _setup_ui(self):
-        self.setStyleSheet("background:rgba(20,20,40,0.50);border-radius:10px;")
+        from utils.themes import panel_qss
+        self.setStyleSheet(panel_qss())
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10); layout.setSpacing(10)
 
         # ===== HEADER ROW =====
         hdr = QHBoxLayout()
-        title = QLabel("  " + L["sm"])
-        title.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
-        title.setStyleSheet("color:#e0e0e0;")
+        title = QLabel(L["sm"])
+        title.setObjectName("pageTitle")
         hdr.addWidget(title)
         hdr.addStretch()
 
-        self.rf_btn = QPushButton("  " + L["rf"] + "  ")
+        self.rf_btn = QPushButton(L["rf"])
         self.rf_btn.clicked.connect(self._load); hdr.addWidget(self.rf_btn)
         layout.addLayout(hdr)
 
@@ -524,20 +524,20 @@ class SoftwareManagerPage(QWidget):
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
 
-        self.ub = QPushButton("  " + L["un"] + "  ")
+        self.ub = QPushButton(L["un"])
         self.ub.setObjectName("redBtn"); self.ub.clicked.connect(self._uninstall)
         action_row.addWidget(self.ub)
 
-        self.fub = QPushButton("  强制卸载  ")
+        self.fub = QPushButton("强制卸载")
         self.fub.setObjectName("redBtn"); self.fub.clicked.connect(self._force_uninstall)
         self.fub.setToolTip("深度扫描+强制删除所有相关文件和注册表")
         action_row.addWidget(self.fub)
 
-        self.del_btn = QPushButton("  " + L["dl"] + "  ")
+        self.del_btn = QPushButton(L["dl"])
         self.del_btn.setObjectName("redBtn"); self.del_btn.clicked.connect(self._delete_residue)
         action_row.addWidget(self.del_btn)
 
-        self.orphan_clean_btn = QPushButton("  清理残留注册表  ")
+        self.orphan_clean_btn = QPushButton("清理残留注册表")
         self.orphan_clean_btn.setObjectName("yellowBtn")
         self.orphan_clean_btn.clicked.connect(self._clean_orphans)
         self.orphan_clean_btn.setToolTip("一键清理所有已失效的注册表项")
@@ -671,6 +671,9 @@ class SoftwareManagerPage(QWidget):
         p.drawText(pix.rect(), Qt.AlignCenter, "?")
         p.end(); return QIcon(pix)
 
+    def update_theme_styles(self):
+        self.setStyleSheet(panel_qss())
+
     def _load(self):
         self.tree.clear(); self.progress.setVisible(True)
         self.status_message.emit(L["sg"] + "...")
@@ -700,10 +703,10 @@ class SoftwareManagerPage(QWidget):
 
     def _on_icon_loaded(self, name, icon):
         self._loaded_icons[name] = icon
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            app = item.data(2, Qt.UserRole)
-            if app and (app.name or "unknown") == name:
+        # 名称 → 行 映射，O(1) 定位；此前每个图标到达都全表扫描 393 行
+        items = getattr(self, "_items_by_name", {}).get(name)
+        if items:
+            for item in items:
                 item.setIcon(1, icon)
 
 
@@ -722,6 +725,17 @@ class SoftwareManagerPage(QWidget):
         sys_filt = self.sys_filter.currentData() if hasattr(self, "sys_filter") else "all"
         show_orphan_only = self.orphan_filter.isChecked() if hasattr(self, "orphan_filter") else False
         self.tree.clear()
+        # 393 行逐条插入时关闭重绘，避免整树反复重排造成的卡顿
+        self.tree.setUpdatesEnabled(False)
+        self._items_by_name = {}
+        try:
+            self._apply_filters_body(tx, drv, sys_filt, show_orphan_only)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self._update_sel_count()
+        self.status_message.emit(L["fo"] + " " + str(len(self._apps)) + L["ya"])
+
+    def _apply_filters_body(self, tx, drv, sys_filt, show_orphan_only):
         default = self._default_icon()
         # Sort by size descending (large first)
         sorted_apps = sorted(self._apps, key=lambda a: a.estimated_size or 0, reverse=True)
@@ -799,9 +813,7 @@ class SoftwareManagerPage(QWidget):
 
             item.setData(2, Qt.UserRole, app)
             self.tree.addTopLevelItem(item)
-
-        self._update_sel_count()
-        self.status_message.emit(L["fo"] + " " + str(len(self._apps)) + L["ya"])
+            self._items_by_name.setdefault(app.name or "unknown", []).append(item)
 
     def _on_click(self, item, col):
         app = item.data(2, Qt.UserRole)
@@ -886,10 +898,33 @@ class SoftwareManagerPage(QWidget):
         app = self._queue[self._idx]
         self.log.append(L["ui"] + ": " + app.name)
         self.status_message.emit(L["un"] + ": " + app.name)
-        ex = UninstallExecutor(); ex.output.connect(lambda s: self.log.append("  " + s))
-        ex.finished.connect(self._on_done); ex.uninstall(app)
+        self._start_executor(app, self._on_done, force=False)
+
+    def _start_executor(self, app, done_slot, force):
+        """Run UninstallExecutor in a worker thread so the UI stays responsive."""
+        self._ex_thread = QThread()
+        self._executor = UninstallExecutor()
+        self._executor.moveToThread(self._ex_thread)
+        self._executor.output.connect(self._append_log)
+        self._executor.finished.connect(done_slot)
+        if force:
+            self._ex_thread.started.connect(lambda a=app: self._executor.force_uninstall(a))
+        else:
+            self._ex_thread.started.connect(lambda a=app: self._executor.uninstall(a))
+        self._ex_thread.start()
+
+    def _append_log(self, text):
+        self.log.append("  " + str(text))
+
+    def _shutdown_executor(self):
+        if getattr(self, "_ex_thread", None):
+            self._ex_thread.quit()
+            self._ex_thread.wait(3000)
+            self._ex_thread = None
+            self._executor = None
 
     def _on_done(self, ok, msg):
+        self._shutdown_executor()
         app = self._queue[self._idx]
         status = "OK" if ok else "失败"
         self.log.append("  => " + status + ": " + msg)
@@ -911,16 +946,15 @@ class SoftwareManagerPage(QWidget):
         names = chr(10).join(a.name + ": " + (a.install_location or "N/A") for a in sel[:5])
         r = QMessageBox.warning(self, L["dct"], L["dcw"] + chr(10) + chr(10) + names + chr(10) + chr(10) + L["dcn"], QMessageBox.Yes|QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes: return
-        import shutil; cleaned = 0
+        cleaned = 0
         for app in sel:
             if app.install_location:
                 loc = app.install_location.strip(chr(34))
                 if _os.path.exists(loc):
-                    try:
-                        if _os.path.isdir(loc): shutil.rmtree(loc, ignore_errors=True)
-                        else: _os.remove(loc)
-                        self.log.append(L["dld"] + ": " + loc); cleaned += 1
-                    except Exception as e: self.log.append(L["fld"] + ": " + str(e))
+                    if recycle_path(loc):
+                        self.log.append(L["dld"] + "(回收站): " + loc); cleaned += 1
+                    else:
+                        self.log.append(L["fld"] + ": " + loc)
         self.log.append(L["clc"] + " " + str(cleaned) + " " + L["ge"])
         self.status_message.emit(L["dld"] + " " + str(cleaned) + " " + L["ge"])
         self._load()
@@ -959,12 +993,10 @@ class SoftwareManagerPage(QWidget):
         app = self._queue[self._idx]
         self.log.append("强制卸载: " + app.name)
         self.status_message.emit("强制卸载: " + app.name)
-        ex = UninstallExecutor()
-        ex.output.connect(lambda s: self.log.append("  " + s))
-        ex.finished.connect(self._on_force_done)
-        ex.force_uninstall(app)
+        self._start_executor(app, self._on_force_done, force=True)
 
     def _on_force_done(self, ok, msg):
+        self._shutdown_executor()
         app = self._queue[self._idx]
         status = "成功" if ok else "失败"
         self.log.append("  => " + status + ": " + msg)
@@ -1032,6 +1064,7 @@ class SoftwareManagerPage(QWidget):
         self._load()
     def _check_residues(self):
         import winreg, shutil
+        from core.uninstaller import _delete_registry_tree
         residues = []
         if not self._success:
             if self._failed:
@@ -1078,10 +1111,20 @@ class SoftwareManagerPage(QWidget):
             cleaned2 = 0
             for typ, path, desc in residues:
                 try:
+                    ok = False
                     if typ == "Files":
-                        if _os.path.isdir(path): shutil.rmtree(path, ignore_errors=True)
-                        elif _os.path.exists(path): _os.remove(path)
-                    self.log.append("  " + L["cld"] + ": " + desc); cleaned2 += 1
+                        ok = recycle_path(path)
+                    else:
+                        deleted_reg = False
+                        for hk in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                            ok2, err2 = _delete_registry_tree(hk, path)
+                            if ok2 and err2 != "已不存在":
+                                deleted_reg = True; break
+                        ok = deleted_reg
+                    if ok:
+                        self.log.append("  " + L["cld"] + ": " + desc); cleaned2 += 1
+                    else:
+                        self.log.append("  " + L["fld"] + ": " + desc)
                 except Exception as e: self.log.append("  " + L["fld"] + ": " + str(e))
             self.log.append(L["clc"] + " " + str(cleaned2) + " " + L["fr"])
             self.status_message.emit(L["cld"] + " " + str(cleaned2) + " " + L["fr"])

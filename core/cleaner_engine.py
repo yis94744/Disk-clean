@@ -31,7 +31,7 @@ class CleanerEngine(QObject):
         items.append(CleanItem("系统错误转储", "系统", ".dmp / .mdmp files", SUGGESTED,
             [os.path.join(root, "Minidump"), os.path.join(root, "MEMORY.DMP")]))
         items.append(CleanItem("预读取缓存", "系统", "Prefetch files", SUGGESTED,
-            [os.path.join(root, "预读取缓存")]))
+            [os.path.join(root, "Prefetch")]))
         items.append(CleanItem("系统日志文件", "系统", "Event logs and log files", CAUTION,
             [os.path.join(root, "Logs"), os.path.join(root, "System32", "LogFiles")]))
         items.append(CleanItem("字体缓存", "系统", "Font cache, auto-rebuilt", SAFE,
@@ -40,13 +40,23 @@ class CleanerEngine(QObject):
             [os.path.join(local, "Google", "Chrome", "User Data", "Default", "Cache")]))
         items.append(CleanItem("Edge 缓存", "浏览器", "Edge browser cache", SAFE,
             [os.path.join(local, "Microsoft", "Edge", "User Data", "Default", "Cache")]))
-        items.append(CleanItem("Firefox 缓存", "浏览器", "Firefox browser cache", SAFE,
-            [os.path.join(appdata, "Mozilla", "Firefox", "Profiles")]))
+        # Firefox 缓存只在 Local 下各配置目录的 cache2，绝不能碰 Roaming 的用户配置
+        firefox_cache = []
+        try:
+            ff_profiles = os.path.join(local, "Mozilla", "Firefox", "Profiles")
+            if os.path.isdir(ff_profiles):
+                for prof in os.listdir(ff_profiles):
+                    c2 = os.path.join(ff_profiles, prof, "cache2")
+                    if os.path.isdir(c2):
+                        firefox_cache.append(c2)
+        except OSError:
+            pass
+        items.append(CleanItem("Firefox 缓存", "浏览器", "Firefox browser cache (cache2)", SAFE,
+            firefox_cache))
         items.append(CleanItem("回收站", "用户", "All drives recycle bin", SAFE))
         items.append(CleanItem("最近文档", "用户", "Recent documents list", SAFE,
             [os.path.join(appdata, "Microsoft", "Windows", "Recent")]))
-        items.append(CleanItem("剪贴板历史", "用户", "Clipboard history", SAFE,
-            [os.path.join(local, "Microsoft", "Windows", "剪贴板历史")]))
+        items.append(CleanItem("剪贴板历史", "用户", "Clipboard history (Win+V)", SAFE))
         items.append(CleanItem("休眠文件", "高级", "hiberfil.sys (needs powercfg)", PROTECTED,
             [os.path.join(os.environ.get("SystemDrive","C:"), "hiberfil.sys")]))
         items.append(CleanItem("DNS 缓存", "高级", "DNS resolver cache", SAFE))
@@ -83,6 +93,10 @@ class CleanerEngine(QObject):
                 self._flush_dns()
                 results.append({"name": item.name, "freed_size": 0, "errors": [], "success": True})
                 continue
+            if item.name == "剪贴板历史":
+                self._clear_clipboard_history()
+                results.append({"name": item.name, "freed_size": 0, "errors": [], "success": True})
+                continue
             self.progress.emit(f"Cleaning: {item.name}")
             freed = 0; errors = []
             for path in item.paths:
@@ -110,3 +124,15 @@ class CleanerEngine(QObject):
     def _flush_dns(self):
         try: subprocess.run(["ipconfig","/flushdns"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=10)
         except: pass
+
+    def _clear_clipboard_history(self):
+        # Windows + V 历史，通过 WinRT Clipboard.ClearHistory() 清空（Win10 1809+）
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "[Windows.ApplicationModel.DataTransfer.Clipboard,"
+                 "Windows.ApplicationModel.DataTransfer,ContentType=WindowsRuntime]|Out-Null;"
+                 "[Windows.ApplicationModel.DataTransfer.Clipboard]::ClearHistory()"],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+        except Exception:
+            pass

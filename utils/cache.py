@@ -56,11 +56,18 @@ class ScanCache:
                         return None
                 data = json.loads(json_str)
                 from core.scanner import ScanNode
-                return [ScanNode(d["p"], d["n"], d["s"], d["mt"], d.get("e", "")) for d in data]
+                nodes = []
+                for d in data:
+                    node = ScanNode(d["p"], d["n"], d["s"])
+                    node.mtime = d.get("mt", 0)
+                    node.ext = d.get("e", "")
+                    nodes.append(node)
+                return nodes
         return None
 
     def clear(self):
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("DELETE FROM scans")
-            conn.execute("VACUUM")
             conn.commit()
+            conn.execute("VACUUM")

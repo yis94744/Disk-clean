@@ -7,8 +7,7 @@ from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter, QPen, QBrush, QFont
 from ui.widgets.treemap import TreemapWidget
 from core.scanner import ScanWorker
-from utils.helpers import get_drives, format_size, format_timestamp, get_file_extension_category
-from utils.cache import ScanCache
+from utils.helpers import get_drives, format_size, format_timestamp, get_file_extension_category, recycle_path
 
 CAT_COLORS = {"Video":"#E91E63","Image":"#4CAF50","Audio":"#2196F3","Document":"#FF9800","Archive":"#9C27B0","Program":"#F44336","Code":"#00BCD4","Folder":"#607D8B","Other":"#888"}
 CAT_NAMES_CN = {"Video":"视频","Image":"图片","Audio":"音频","Document":"文档","Archive":"压缩包","Program":"程序","Code":"代码","Folder":"文件夹","Other":"其他"}
@@ -49,11 +48,16 @@ class DiskAnalyzerPage(QWidget):
         super().__init__(parent)
         self._worker = None; self._root = None
         self._checkboxes = {}
-        self._cache = ScanCache()
         self._setup_ui()
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 4); layout.setSpacing(6)
+        layout.setContentsMargins(12, 12, 12, 8); layout.setSpacing(8)
+        # 第 1 行：标题（左）
+        tb0 = QHBoxLayout()
+        t = QLabel("磁盘分析")
+        t.setObjectName("pageTitle"); tb0.addWidget(t); tb0.addStretch()
+        layout.addLayout(tb0)
+        # 第 2 行：扫描操作（左） + 危险操作（右）
         tb = QHBoxLayout()
         self.drive_combo = QComboBox(); self.drive_combo.setMinimumWidth(100)
         for d in get_drives(): self.drive_combo.addItem(d, d)
@@ -220,18 +224,6 @@ class DiskAnalyzerPage(QWidget):
             if node and node.is_dir: self.treemap.drill_down(node); self._populate_list(node)
         except: pass
 
-    def _open_selected(self):
-        it = self.file_tree.currentItem()
-        if not it: return
-        node = it.data(1, Qt.UserRole)
-        if node:
-            try:
-                import subprocess as _sp
-                fp = node.path if hasattr(node, 'path') else ''
-                if fp and os.path.exists(fp):
-                    _sp.Popen(['explorer', '/select,', os.path.normpath(fp)], shell=False)
-            except: pass
-
     def _delete_selected(self):
         to_delete = []
         for i in range(self.file_tree.topLevelItemCount()):
@@ -246,17 +238,14 @@ class DiskAnalyzerPage(QWidget):
         names = chr(10).join(n.name + " (" + format_size(n.size) + ")" for n, _ in items)
         if len(to_delete) > 10: names += chr(10) + "... 还有 " + str(len(to_delete)-10) + " 个"
         r = QMessageBox.warning(self, "确认删除",
-            "将永久删除以下文件：\n\n" + names + "\n\n此操作不可撤销，确定继续？",
+            "以下内容将移入回收站：\n\n" + names + "\n\n确定继续？",
             QMessageBox.Yes|QMessageBox.No, QMessageBox.No)
         if r != QMessageBox.Yes: return
         cleaned = 0; failed = 0
         for node, _ in to_delete:
-            try:
-                if node.is_dir: shutil.rmtree(node.path, ignore_errors=True)
-                elif _os.path.exists(node.path): _os.remove(node.path)
-                cleaned += 1
-            except: failed += 1
-        msg = "已删除 " + str(cleaned) + " 个"
+            if recycle_path(node.path): cleaned += 1
+            else: failed += 1
+        msg = "已移入回收站 " + str(cleaned) + " 个"
         if failed: msg += " (" + str(failed) + " 失败)"
         self.status_message.emit(msg)
         QMessageBox.information(self, "结果", msg)

@@ -6,7 +6,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtGui import QFont, QIntValidator
 from utils.themes import THEMES, load_settings, SETTINGS_FILE
 
-DEFAULTS = {'scan_limit':50000,'theme':'deep','minimize_to_tray':False,'auto_start':False,'confirm_high_risk':True,'show_system_files':False,'expert_mode':False,'scan_min_size_mb':1,'max_results':500,'language':'zh'}
+DEFAULTS = {'scan_limit':50000,'theme':'green','minimize_to_tray':False,'auto_start':False,'confirm_high_risk':True,'show_system_files':False,'expert_mode':False,'scan_min_size_mb':1,'max_results':500,'language':'zh'}
 
 class SettingsPage(QWidget):
     status_message = Signal(str)
@@ -32,8 +32,7 @@ class SettingsPage(QWidget):
     def _setup_ui(self):
         l = QVBoxLayout(self); l.setContentsMargins(20, 20, 20, 20); l.setSpacing(14)
         t = QLabel('\u8bbe\u7f6e')
-        t.setFont(QFont('Microsoft YaHei', 18, QFont.Bold))
-        t.setStyleSheet('color: #e0e0e0;'); l.addWidget(t)
+        t.setObjectName("pageTitle"); l.addWidget(t)
 
         c1 = QFrame(); c1.setObjectName('card'); cl1 = QVBoxLayout(c1)
         cl1.setContentsMargins(14, 10, 14, 10); cl1.setSpacing(10)
@@ -45,7 +44,7 @@ class SettingsPage(QWidget):
         self.tc = QComboBox()
         for k, t in THEMES.items():
             self.tc.addItem(t.get('name', k), k)
-        cur = self._settings.get('theme', 'deep')
+        cur = self._settings.get('theme', 'green')
         self.tc.setCurrentText(THEMES.get(cur, {}).get('name', '\u6df1\u591c'))
         self.tc.currentIndexChanged.connect(self._on_theme_change)
         r1.addWidget(self.tc); r1.addStretch(); cl1.addLayout(r1)
@@ -75,6 +74,14 @@ class SettingsPage(QWidget):
         self.cb_confirm = QCheckBox('\u786e\u8ba4\u9ad8\u98ce\u9669\u64cd\u4f5c (\u9632\u6b62\u8bef\u5220)')
         self.cb_confirm.setChecked(self._settings.get('confirm_high_risk', True))
         self.cb_confirm.toggled.connect(lambda v: self._on_setting_change('confirm_high_risk', v)); cl2.addWidget(self.cb_confirm)
+
+        self.cb_auto = QCheckBox('\u5f00\u673a\u81ea\u542f\u52a8')
+        self.cb_auto.setChecked(self._settings.get('auto_start', False))
+        self.cb_auto.toggled.connect(self._on_auto_start); cl2.addWidget(self.cb_auto)
+
+        self.cb_tray = QCheckBox('\u5173\u95ed\u65f6\u6700\u5c0f\u5316\u5230\u6258\u76d8')
+        self.cb_tray.setChecked(self._settings.get('minimize_to_tray', False))
+        self.cb_tray.toggled.connect(lambda v: self._on_setting_change('minimize_to_tray', v)); cl2.addWidget(self.cb_tray)
 
         r3 = QHBoxLayout(); r3.addWidget(QLabel('\u6700\u5c0f\u626b\u63cf\u6587\u4ef6(MB):'))
         self.sb1 = QLineEdit()
@@ -111,6 +118,17 @@ class SettingsPage(QWidget):
         self._save()
         self.status_message.emit(f'\u8bbe\u7f6e\u5df2\u4fdd\u5b58: {key}={value}')
 
+    def _on_auto_start(self, v):
+        from utils.helpers import set_auto_start
+        ok = set_auto_start(v)
+        self._settings['auto_start'] = v
+        self._save()
+        state = '\u5f00\u542f' if v else '\u5173\u95ed'
+        if ok:
+            self.status_message.emit('\u5f00\u673a\u81ea\u542f\u52a8\u5df2' + state)
+        else:
+            self.status_message.emit('\u5f00\u673a\u81ea\u542f\u52a8\u8bbe\u7f6e\u5931\u8d25(\u6743\u9650\u4e0d\u8db3?)')
+
     def _on_text_change(self, key, text, default_val):
         try:
             val = int(text) if text else default_val
@@ -130,12 +148,14 @@ class SettingsPage(QWidget):
     def _do_reset(self):
         self._settings = dict(DEFAULTS)
         self._save()
-        self.tc.setCurrentText(THEMES['deep']['name'])
+        self.tc.setCurrentText(THEMES['green']['name'])
         self.lc.setCurrentText('\u4e2d\u6587')
         self.cb_expert.setChecked(False)
         self.cb_sys.setChecked(False)
         self.cb_confirm.setChecked(True)
-        self.sb1.setText('1'); self.sb2.setText('500'); self.sb_scan_limit.setText('50000')
-        self.theme_changed.emit('deep')
+        self.cb_auto.setChecked(False)
+        self.cb_tray.setChecked(False)
+        self.sb1.setText('1'); self.sb2.setText('500')
+        self.theme_changed.emit('green')
         QMessageBox.information(self, '\u8bbe\u7f6e', '\u5df2\u6062\u590d\u9ed8\u8ba4\u8bbe\u7f6e')
         self.status_message.emit('\u8bbe\u7f6e\u5df2\u91cd\u7f6e')

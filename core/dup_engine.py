@@ -27,9 +27,9 @@ class DupFinder(QThread):
         if total==0: self.progress.emit("未找到文件",0,0); self.finished.emit([]); return
         self.progress.emit(f"共{total} 个文件, 按大小分组...",0,total)
         by_key=defaultdict(list)
-        for fp,sz,mt in all_files: by_key[(sz,mt)].append(fp)
+        for fp,sz,mt in all_files: by_key[sz].append(fp)
         candidates=[]
-        for (sz,mt),group in by_key.items():
+        for sz,group in by_key.items():
             if len(group)>1: candidates.append((sz,group))
         cf=sum(len(g) for _,g in candidates)
         if cf==0: self.progress.emit("无候选重复文件",0,0); self.finished.emit([]); return
@@ -38,10 +38,8 @@ class DupFinder(QThread):
         for sz,group in candidates:
             if self._cancel_flag: break
             existing=[f for f in group if os.path.exists(f)]
-            if len(existing)<2: processed+=len(group); continue
-            if len(existing)==2:
-                if self._quick_compare(existing[0],existing[1]): all_groups.append(existing); self.found_group.emit(existing)
-                processed+=2
+            if len(existing)<2:
+                processed+=len(group)
             else:
                 bh=self._hash_parallel(existing)
                 for dups in bh.values():
@@ -71,18 +69,6 @@ class DupFinder(QThread):
                         result.append((entry.path,sz,int(st.st_mtime)))
                 except (OSError,FileNotFoundError): continue
         except (PermissionError,OSError): pass
-
-    def _quick_compare(self, fp1, fp2):
-        try:
-            s1=os.path.getsize(fp1); s2=os.path.getsize(fp2)
-            if s1!=s2: return False
-            with open(fp1,"rb") as f1, open(fp2,"rb") as f2:
-                if f1.read(PARTIAL_SIZE)!=f2.read(PARTIAL_SIZE): return False
-                if s1>PARTIAL_SIZE*2:
-                    f1.seek(-PARTIAL_SIZE,2); f2.seek(-PARTIAL_SIZE,2)
-                    if f1.read(PARTIAL_SIZE)!=f2.read(PARTIAL_SIZE): return False
-            return True
-        except (OSError,PermissionError,FileNotFoundError): return False
 
     def _hash_parallel(self, files):
         bh=defaultdict(list)
