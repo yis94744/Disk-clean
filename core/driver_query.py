@@ -94,6 +94,46 @@ def age_of(date_str):
         return None
 
 
+
+# ---- 噪音设备过滤与硬件分组 ----
+
+# 这些"驱动"不是真实硬件，逐条展示只会产生噪音（默认折叠进"其它驱动"）
+def is_noise_device(name, maker):
+    n = (name or "").lower()
+    m = (maker or "").lower()
+    if n.startswith("wan miniport"):
+        return True
+    if "virtual" in n:
+        return True
+    if "kernel debug" in n:
+        return True
+    if "idd" in n and "oray" in m:
+        return True
+    if "(standard system devices)" in m:
+        return True
+    return False
+
+
+# 硬件大类分组定义：(类别码列表, 组名, 图标)
+DRIVER_GROUPS = [
+    (("DISPLAY",), "显卡驱动", "🖥️"),
+    (("MEDIA",), "声卡驱动", "🎵"),
+    (("NET",), "网卡驱动", "🌐"),
+    (("HDC", "SCSIADAPTER"), "存储控制器驱动", "💾"),
+    (("SYSTEM",), "芯片组 / 系统设备", "🧩"),
+    (("USB",), "USB 设备", "🔌"),
+]
+
+# 组建议聚合优先级：越大的代表组
+_ADVICE_RANK = {ADVICE_OK: 0, ADVICE_WU: 1, ADVICE_CHECK: 2, ADVICE_OLD: 3}
+
+
+def group_advice(advices):
+    """组建议 = 组内最需要关注的那条。"""
+    if not advices:
+        return ADVICE_OK
+    return max(advices, key=lambda a: _ADVICE_RANK.get(a, 0))
+
 class DriverScanWorker(QThread):
     """后台枚举 Win32_PnPSignedDriver 中的重点类别驱动。"""
     progress = Signal(str)

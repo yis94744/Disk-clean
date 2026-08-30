@@ -16,7 +16,8 @@ from PySide6.QtGui import QColor, QBrush, QAction
 
 from core.driver_query import (DriverScanWorker, open_site, WINDOWS_UPDATE,
     ADVICE_OK, ADVICE_CHECK, ADVICE_OLD, ADVICE_WU, ADVICE_LABELS,
-    CATEGORY_NAMES, IMPORTANT_CLASSES)
+    CATEGORY_NAMES, IMPORTANT_CLASSES, is_noise_device, DRIVER_GROUPS,
+    group_advice)
 
 _ADVICE_COLOR = {
     ADVICE_OK: "#4CAF50",
@@ -69,31 +70,28 @@ class DriverMgrPage(QWidget):
         row2.addWidget(self.slbl)
         layout.addLayout(row2)
 
-        # 第 3 行：过滤器
+        # 第 3 行：过滤器（分组即分类，这里只留搜索与建议过滤）
         row3 = QHBoxLayout()
-        row3.addWidget(QLabel("类别:"))
-        self.cat_combo = QComboBox()
-        self.cat_combo.setMinimumWidth(100)
-        self.cat_combo.addItem("全部类别", "")
-        for en, cn in CATEGORY_NAMES.items():
-            self.cat_combo.addItem(cn, en)
-        self.cat_combo.currentIndexChanged.connect(self._apply_filter)
-        row3.addWidget(self.cat_combo)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索设备/厂商...")
-        self.search_edit.setMaximumWidth(170)
+        self.search_edit.setMaximumWidth(220)
         self.search_edit.textChanged.connect(self._apply_filter)
         row3.addWidget(self.search_edit)
         self.only_advice = QPushButton("仅看建议更新")
         self.only_advice.setCheckable(True)
         self.only_advice.clicked.connect(self._apply_filter)
         row3.addWidget(self.only_advice)
+        self.show_all_chk = QPushButton("显示全部小驱动")
+        self.show_all_chk.setCheckable(True)
+        self.show_all_chk.setToolTip("默认隐藏 WAN Miniport、虚拟设备等碎片驱动，勾选后完整展示")
+        self.show_all_chk.clicked.connect(self._apply_filter)
+        row3.addWidget(self.show_all_chk)
         row3.addStretch()
         layout.addLayout(row3)
 
         # 主列表
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["设备名", "类别", "厂商", "当前版本", "驱动日期", "AI 建议"])
+        self.tree.setHeaderLabels(["硬件分类 / 设备", "类别", "厂商", "当前版本", "驱动日期", "AI 建议"])
         self.tree.setColumnWidth(0, 300)
         self.tree.setColumnWidth(1, 90)
         self.tree.setColumnWidth(2, 170)
@@ -144,25 +142,90 @@ class DriverMgrPage(QWidget):
         self.progress.setVisible(False)
         self._apply_filter()
         need = sum(1 for d in drivers if d["advice"] in (ADVICE_CHECK, ADVICE_OLD))
-        self.summary_lbl.setText(
-            f"共 {len(drivers)} 个驱动设备 | {need} 个建议检查更新")
-        self.slbl.setText("扫描完成——双击设备行或点「前往选中设备官网」直达官方驱动下载页")
-        self.status_message.emit(f"驱动检测: {len(drivers)} 个设备，{need} 个建议检查更新")
+        self.status_message.emit(f"驱动检测: {len(drivers)} 个驱动，{need} 个建议检查更新")
 
     # ---------- 过滤 ----------
     def _apply_filter(self):
-        cat = self.cat_combo.currentData() or ""
         tx = self.search_edit.text().lower() if hasattr(self, "search_edit") else ""
         only = self.only_advice.isChecked() if hasattr(self, "only_advice") else False
+        show_all = self.show_all_chk.isChecked() if hasattr(self, "show_all_chk") else False
         self.tree.clear()
+        self.summary_lbl.setText("")
+
+        # 按类别码分桶；噪音设备（WAN Miniport/虚拟设备等）归入"其它驱动"折叠组
+        buckets = {gname: [] for _, gname, _ in DRIVER_GROUPS}
+        buckets["其它驱动"] = []
         for d in self._drivers:
-            if cat and d["cls"] != cat:
+            noise = is_noise_device(d["name"], d["maker"])
+            placed = False
+            for codes, gname, _ in DRIVER_GROUPS:
+                if d["cls"] in codes:
+                    buckets[gname].append(d)
+                    placed = True
+                    break
+            if not placed or noise:
+                # 噪音设备从原组移入"其它驱动"
+                if noise and placed:
+                    for codes, gname, _ in DRIVER_GROUPS:
+                        if d["cls"] in codes and d in buckets[gname]:
+                            buckets[gname].remove(d)
+                            break
+                buckets["其它驱动"].append(d)
+
+        need_groups = 0
+        total_check = 0
+        for codes, gname, icon in DRIVER_GROUPS:
+            devs = buckets.get(gname, [])
+            if only:
+                devs = [d for d in devs if d["advice"] in (ADVICE_CHECK, ADVICE_OLD)]
+            if tx:
+                devs = [d for d in devs if tx in d["name"].lower() or tx in (d["maker"] or "").lower()]
+            if not devs:
                 continue
-            if only and d["advice"] not in (ADVICE_CHECK, ADVICE_OLD):
-                continue
-            if tx and tx not in d["name"].lower() and tx not in d["maker"].lower():
-                continue
-            self.tree.addTopLevelItem(self._make_row(d))
+            gadv = group_advice([d["advice"] for d in devs])
+            if gadv in (ADVICE_CHECK, ADVICE_OLD):
+                need_groups += 1
+            total_check += sum(1 for d in devs if d["advice"] in (ADVICE_CHECK, ADVICE_OLD))
+            main_dev = devs[0]
+            gnode = QTreeWidgetItem()
+            gnode.setText(0, f"{icon} {gname}")
+            gnode.setText(2, f"{len(devs)} 个设备")
+            gnode.setText(3, main_dev["version"])
+            gnode.setText(4, main_dev["date"])
+            gnode.setText(5, ADVICE_LABELS.get(gadv, gadv))
+            color = QColor(_ADVICE_COLOR.get(gadv, "#888"))
+            gnode.setForeground(5, QBrush(color))
+            gnode.setForeground(0, QBrush(QColor("#e9f5ec")))
+            bf = gnode.font(0)
+            bf.setBold(True)
+            gnode.setFont(0, bf)
+            gnode.setData(0, Qt.UserRole, main_dev)
+            gnode.setData(0, Qt.UserRole + 1, "group")
+            self.tree.addTopLevelItem(gnode)
+            for d in devs:
+                gnode.addChild(self._make_row(d))
+        # 其它驱动（含噪音碎片）折叠展示，不参与建议计数
+        others = buckets.get("其它驱动", [])
+        if show_all and others:
+            if tx:
+                others = [d for d in others if tx in d["name"].lower() or tx in (d["maker"] or "").lower()]
+            if others:
+                gnode = QTreeWidgetItem()
+                gnode.setText(0, f"🔧 其它驱动（WAN Miniport / 虚拟设备等碎片）")
+                gnode.setText(2, f"{len(others)} 个设备")
+                self.tree.addTopLevelItem(gnode)
+                for d in others:
+                    gnode.addChild(self._make_row(d))
+        self.tree.expandAll()
+        # 设备多的大组默认折叠，保持首屏聚焦显卡/声卡/网卡等重点分类
+        for i in range(self.tree.topLevelItemCount()):
+            g = self.tree.topLevelItem(i)
+            if g.childCount() > 10:
+                g.setExpanded(False)
+        self.summary_lbl.setText(
+            f"共 {len(self._drivers)} 个驱动 | {need_groups} 个硬件分类建议检查更新"
+            + (f" | {total_check} 个具体驱动待更新" if total_check else ""))
+        self.slbl.setText("按硬件分类展示——点击分类行或设备行，再点「前往选中设备官网」直达下载页")
 
     def _make_row(self, d):
         item = QTreeWidgetItem()
@@ -176,7 +239,8 @@ class DriverMgrPage(QWidget):
         item.setForeground(5, QBrush(color))
         if d["advice"] == ADVICE_OLD:
             item.setForeground(0, QBrush(QColor("#F85149")))
-        item.setToolTip(0, d["name"] + "\n官网: " + (d["site"] if d["site"].startswith("http") else "Windows 更新（可选更新）"))
+        item.setToolTip(0, d["name"] + "  |  官网: " +
+                        (d["site"] if d["site"].startswith("http") else "Windows 更新（可选更新）"))
         item.setData(0, Qt.UserRole, d)
         return item
 
