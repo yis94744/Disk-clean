@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """SQLite cache for flat scan results."""
-import os, sqlite3, json, time, zlib
+import os, sys, sqlite3, json, time, zlib
 
 class ScanCache:
     def __init__(self, db_path=None):
         if db_path is None:
-            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+            if getattr(sys, "frozen", False):
+                # PyInstaller 打包后：缓存库写到 %APPDATA%\DiskCleaner，保证可写且持久。
+                base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DiskCleaner")
+                try:
+                    os.makedirs(base, exist_ok=True)
+                except OSError:
+                    base = os.path.dirname(os.path.abspath(sys.argv[0]))
+                db_path = os.path.join(base, "scan_cache.db")
+            else:
+                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "scan_cache.db")
         self.db_path = db_path
         self._init_db()

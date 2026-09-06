@@ -1,8 +1,18 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Theme system for Disk Cleaner Pro - transparent glassmorphic"""
-import json, os
+import json, os, sys
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json")
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包后：项目目录不可写（onefile 每次运行还会换临时目录），
+    # 设置文件改存到 %APPDATA%\DiskCleaner，保证配置持久化。
+    _data_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DiskCleaner")
+    try:
+        os.makedirs(_data_dir, exist_ok=True)
+    except OSError:
+        _data_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    SETTINGS_FILE = os.path.join(_data_dir, "settings.json")
+else:
+    SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.json")
 
 THEMES = {
     "green": {
