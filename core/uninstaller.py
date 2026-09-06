@@ -4,8 +4,10 @@ import os, subprocess, winreg, shutil, time
 from PySide6.QtCore import QObject, Signal
 from utils.helpers import recycle_path
 
+# 注意：timeout 由 _run() 的参数统一传入，不能写死在这里，
+# 否则 subprocess.run 收到重复的 timeout 关键字参数直接 TypeError。
 SP_KWARGS = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace",
-             "timeout": 180, "creationflags": subprocess.CREATE_NO_WINDOW}
+             "creationflags": subprocess.CREATE_NO_WINDOW}
 
 # 进程名 -> 永不允许强制卸载器结束的系统关键进程
 PROTECTED_PROCESSES = {
@@ -18,6 +20,40 @@ PROTECTED_PROCESSES = {
 def _name_token(text):
     """Lowercase alphanumeric token of an app/publisher name for matching."""
     return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def parse_command_line(s):
+    """把 Windows 命令行字符串切分为 argv，正确处理双引号。
+
+    注册表 UninstallString 形如 '"C:\\...\\Uninstall App.exe" /currentuser'，
+    之前用 .strip('"') 只去掉首尾引号，中间引号仍在，shell=True 时 cmd 解析失败。
+    """
+    toks, cur, in_q = [], [], False
+    for ch in (s or ""):
+        if ch == '"':
+            in_q = not in_q
+        elif ch in " \t" and not in_q:
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        toks.append("".join(cur))
+    return toks
+
+
+def _split_first_token(raw):
+    """返回 (第一个token, 其余原文)，其余部分保持原始引号不做改写。"""
+    s = raw.lstrip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end > 0:
+            return s[1:end], s[end + 1:].lstrip()
+    for i, ch in enumerate(s):
+        if ch in " \t":
+            return s[:i], s[i:].lstrip()
+    return s, ""
 
 class AppInfo:
     __slots__ = ("name","version","publisher","install_location",
@@ -180,45 +216,159 @@ class UninstallExecutor(QObject):
         except Exception as e:
             return -1, "", str(e)
 
+    # 视为成功的卸载器返回码：
+    #   0=成功  1605=软件未安装  3010/1641=成功但需重启
+    SUCCESS_EXIT_CODES = {0, 1605, 3010, 1641}
+    # 用户主动取消的返回码：1=常见取消码(NSIS/Inno)  1602=MSI 用户取消
+    CANCEL_EXIT_CODES = {1, 1602}
+
+    def _launch_uninstaller(self, app, timeout=600):
+        """以正确的方式启动原生卸载程序。返回 (返回码, 错误信息)。
+
+        - 注册表里的 '"exe 路径 带空格" 参数' 必须按引号解析后用 argv 启动，
+          否则 cmd 解析失败返回 1，被误判为“用户取消”。
+        - requireAdministrator 的卸载器在 CreateProcess 下报 WinError 740，
+          此时用 ShellExecuteW(runas) 走 UAC 提权。
+        """
+        raw = (app.uninstall_string or "").strip()
+        if not raw:
+            return None, "没有卸载程序信息"
+        self.output.emit("运行原生卸载程序: " + raw[:160])
+        argv = parse_command_line(raw)
+        exe = argv[0] if argv else ""
+        exe_file = exe
+        if exe and not os.path.isabs(exe):
+            exe_file = shutil.which(exe) or exe
+        use_argv = bool(exe) and os.path.isabs(exe_file) and os.path.isfile(exe_file)
+        try:
+            if use_argv:
+                proc = subprocess.Popen(argv)
+            else:
+                # 畸形注册表项（未加引号的带空格路径等），退回 shell 让 cmd 解释
+                proc = subprocess.Popen(raw, shell=True)
+        except OSError as e:
+            if getattr(e, "winerror", 0) == 740:
+                return self._launch_elevated(raw, timeout)
+            return None, str(e)
+        try:
+            proc.wait(timeout=timeout)
+            return proc.returncode, ""
+        except subprocess.TimeoutExpired:
+            raise
+
+    def _launch_elevated(self, raw, timeout, verb="runas"):
+        """通过 ShellExecuteW 启动（支持 UAC 提权），返回 (返回码, 错误信息)。"""
+        import ctypes
+        from ctypes import wintypes
+
+        file_tok, params = _split_first_token(raw)
+
+        class SHELLEXECUTEINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                ("dwHotKey", wintypes.DWORD), ("hIconOrMonitor", wintypes.HANDLE),
+                ("hProcess", wintypes.HANDLE),
+            ]
+
+        SEE_MASK_NOCLOSEPROCESS = 0x00000040
+        SEE_MASK_NOASYNC = 0x00000100
+        sei = SHELLEXECUTEINFO()
+        sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+        sei.lpVerb = verb
+        sei.lpFile = file_tok or raw
+        sei.lpParameters = params or None
+        sei.nShow = 1  # SW_SHOWNORMAL：卸载窗口要显示给用户
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) or not sei.hProcess:
+            # 用户在 UAC 弹窗点了“否”等场景
+            return 1602, "用户拒绝了管理员权限请求 (UAC)"
+        WAIT_OBJECT_0 = 0
+        WAIT_TIMEOUT = 0x00000102
+        res = ctypes.windll.kernel32.WaitForSingleObject(
+            sei.hProcess, int(timeout * 1000))
+        if res == WAIT_TIMEOUT:
+            raise subprocess.TimeoutExpired(raw, timeout)
+        exit_code = wintypes.DWORD()
+        ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+        return exit_code.value, ""
+
+    def _wait_uninstalled(self, app, seconds):
+        """轮询等待软件从注册表消失。
+
+        NSIS 类卸载器会把自己复制到 %TEMP% 再重启，原进程立即退出而卸载仍在
+        进行，wait() 返回时注册表往往还没删，需要轮询等待。
+        """
+        interval = 2
+        waited = 0
+        while waited < seconds:
+            if not self._check_installed(app):
+                return True
+            time.sleep(interval)
+            waited += interval
+            if waited % 10 == 0:
+                self.output.emit("  等待卸载完成... (" + str(waited) + "s)")
+        return not self._check_installed(app)
+
     def uninstall(self, app):
         """直接调用软件原生卸载程序"""
-        self.output.emit("正在卸载: " + app.name)
-
-        if app.uninstall_string:
-            cmd = app.uninstall_string.strip().strip('"')
-            self.output.emit("运行原生卸载程序: " + cmd[:120])
+        if app.uninstall_string and app.uninstall_string.strip():
+            timed_out = False
             try:
-                # 不使用 capture_output 和 CREATE_NO_WINDOW，让原生卸载窗口正常显示
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait(timeout=300)
-                code = proc.returncode
-                time.sleep(2)
-                if not self._check_installed(app):
-                    self.finished.emit(True, "卸载成功"); return
-                elif code != 0:
-                    self.output.emit("用户取消或原生卸载失败（返回码 " + str(code) + "）")
-                    self.finished.emit(False, "用户取消卸载" if code == 1 else "原生卸载失败"); return
-                else:
-                    self.output.emit("卸载程序已运行，但注册表仍存在，尝试 winget...")
+                code, err = self._launch_uninstaller(app, timeout=600)
             except subprocess.TimeoutExpired:
-                self.output.emit("原生卸载超时，尝试 winget...")
-            except Exception as e:
-                self.output.emit("运行原生卸载程序失败: " + str(e))
+                code, timed_out = None, True
+            if timed_out:
+                self.output.emit("原生卸载超时，等待其自行结束...")
+                if self._wait_uninstalled(app, 15):
+                    self.finished.emit(True, "卸载成功")
+                else:
+                    self.finished.emit(False, "原生卸载超时 - 请重试或使用强制卸载")
+                return
+            if code is None:
+                self.output.emit("无法启动卸载程序: " + err)
+            elif code in self.SUCCESS_EXIT_CODES:
+                if self._wait_uninstalled(app, 60):
+                    self.finished.emit(True, "卸载成功")
+                    return
+                self.output.emit("卸载程序已运行，但注册表仍存在，尝试 winget...")
+            else:
+                # 非零返回码：短暂等待，防止卸载器返回码不可靠
+                if self._wait_uninstalled(app, 6):
+                    self.finished.emit(True, "卸载成功")
+                    return
+                if code in self.CANCEL_EXIT_CODES:
+                    self.output.emit("用户取消或原生卸载失败（返回码 " + str(code) + "）")
+                    self.finished.emit(False, "用户取消卸载")
+                    return
+                self.output.emit("原生卸载失败（返回码 " + str(code) + "），尝试 winget...")
+        else:
+            self.output.emit("没有卸载程序信息，尝试 winget...")
 
-        # Fallback: winget (only when uninstall_string was None)
+        # Fallback: winget
         self.output.emit("尝试 winget...")
         try:
             code, out, err = self._run(
                 ["winget", "uninstall", "--name", app.name, "--silent", "--accept-source-agreements"],
                 timeout=120)
             if code == 0:
-                time.sleep(1)
-                if not self._check_installed(app):
-                    self.finished.emit(True, "已通过 winget 卸载"); return
-        except: pass
+                if self._wait_uninstalled(app, 30):
+                    self.finished.emit(True, "已通过 winget 卸载")
+                    return
+            else:
+                detail = (err or out or "").strip()
+                self.output.emit("winget 退出码 " + str(code) + (": " + detail[:120] if detail else ""))
+        except Exception as e:
+            self.output.emit("winget 不可用: " + str(e))
 
         if not self._check_installed(app):
-            self.finished.emit(True, "已移除"); return
+            self.finished.emit(True, "已移除")
+            return
 
         self.finished.emit(False, "卸载失败 - 请尝试强制卸载")
 
@@ -228,18 +378,19 @@ class UninstallExecutor(QObject):
 
         # Step 1: Try normal uninstall first (interactive)
         if app.uninstall_string:
-            cmd = app.uninstall_string.strip().strip('"')
-            # Try interactive first so user can cancel if they want
+            # Run interactive so user sees the uninstall dialog
             self.output.emit("步骤1: 运行官方卸载程序...")
             try:
-                # Run without /quiet so user sees the uninstall dialog
-                code, out, err = self._run(cmd, shell=True, timeout=300)
-                if code == 0:
+                code, err = self._launch_uninstaller(app, timeout=600)
+                if code is None:
+                    self.output.emit("无法启动官方卸载程序: " + err)
+                elif code in self.SUCCESS_EXIT_CODES:
+                    self._wait_uninstalled(app, 30)
                     self.output.emit("官方卸载程序完成")
-                elif code == -2:
-                    self.output.emit("卸载程序超时")
                 else:
                     self.output.emit("卸载程序返回: " + str(code))
+            except subprocess.TimeoutExpired:
+                self.output.emit("卸载程序超时，继续强制清理...")
             except Exception as e:
                 self.output.emit("运行卸载程序出错: " + str(e))
 
@@ -273,24 +424,24 @@ class UninstallExecutor(QObject):
             self.finished.emit(True, "强制卸载成功（" + str(total) + " 项已清理）")
 
     def _check_installed(self, app):
-        """Check if app still appears in registry or files exist."""
-        # Check if install dir still exists
-        if app.install_location:
-            loc = app.install_location.strip('"')
-            if os.path.exists(loc):
+        """以注册表为准判断软件是否仍处于已安装状态。
+
+        遗留的安装目录/文件不再算“仍安装”——很多卸载器会留下空目录或日志，
+        之前因此把卸载成功的软件误判为失败。
+        """
+        # 1) 本应用的注册表卸载键（最权威）
+        if app.registry_key:
+            try:
+                hive = winreg.HKEY_LOCAL_MACHINE if app.hive == "HKLM" else winreg.HKEY_CURRENT_USER
+                key = winreg.OpenKey(hive, app.registry_key)
+                winreg.CloseKey(key)
                 return True
-        # Check registry
-        try:
-            if app.hive == "HKLM":
-                hive = winreg.HKEY_LOCAL_MACHINE
-            else:
-                hive = winreg.HKEY_CURRENT_USER
-            key = winreg.OpenKey(hive, app.registry_key)
-            winreg.CloseKey(key)
-            return True
-        except:
-            pass
-        # Also check alternate registry locations
+            except OSError:
+                pass
+        # 2) 三个卸载键里按名称查找：精确匹配优先，长名称(>=5字符)包含匹配兜底
+        nl = (app.name or "").lower()
+        if not nl:
+            return False
         reg_paths = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
@@ -299,22 +450,37 @@ class UninstallExecutor(QObject):
         for root_key, subpath in reg_paths:
             try:
                 key = winreg.OpenKey(root_key, subpath)
-                i = 0
-                while True:
-                    try:
-                        skn = winreg.EnumKey(key, i)
-                        sk = winreg.OpenKey(root_key, subpath + "\\" + skn)
-                        try:
-                            dn = str(winreg.QueryValueEx(sk, "DisplayName")[0])
-                            if app.name.lower() in dn.lower():
-                                winreg.CloseKey(sk)
-                                return True
-                        except: pass
-                        winreg.CloseKey(sk)
-                    except OSError: break
-                    i += 1
+            except OSError:
+                continue
+            i = 0
+            found = False
+            while True:
+                try:
+                    skn = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    sk = winreg.OpenKey(root_key, subpath + "\\" + skn)
+                except OSError:
+                    continue
+                try:
+                    dn = str(winreg.QueryValueEx(sk, "DisplayName")[0]).lower()
+                except OSError:
+                    dn = ""
+                try:
+                    winreg.CloseKey(sk)
+                except OSError:
+                    pass
+                if dn == nl or (len(nl) >= 5 and nl in dn):
+                    found = True
+                    break
+            try:
                 winreg.CloseKey(key)
-            except: pass
+            except OSError:
+                pass
+            if found:
+                return True
         return False
 
     def _kill_related(self, app):

@@ -391,9 +391,14 @@ def _resolve_exe_path(app):
             except Exception:
                 pass
     if app.uninstall_string:
-        us = app.uninstall_string.strip(chr(34)).strip("'")
-        if us and _os.path.isfile(us) and us.lower().endswith(".exe"):
-            candidates.append(us)
+        # UninstallString 形如 '"C:\\...\\Uninstall App.exe" /args'，需按引号解析取 exe
+        try:
+            from core.uninstaller import parse_command_line
+            toks = parse_command_line(app.uninstall_string)
+            if toks and toks[0].lower().endswith(".exe") and _os.path.isfile(toks[0]):
+                candidates.append(toks[0])
+        except Exception:
+            pass
     return candidates
 
 def _extract_icon_safe(filepath):
@@ -704,10 +709,14 @@ class SoftwareManagerPage(QWidget):
     def _on_icon_loaded(self, name, icon):
         self._loaded_icons[name] = icon
         # 名称 → 行 映射，O(1) 定位；此前每个图标到达都全表扫描 393 行
-        items = getattr(self, "_items_by_name", {}).get(name)
-        if items:
-            for item in items:
+        # 注意竞态：图标线程异步返回期间树可能已被重建（搜索/刷新触发 clear），
+        # 旧 item 的 C++ 对象已删除，setIcon 会抛 RuntimeError——跳过即可，
+        # 重建时 _apply_filters_body 会从 _loaded_icons 缓存补上图标。
+        for item in (getattr(self, "_items_by_name", {}) or {}).get(name) or []:
+            try:
                 item.setIcon(1, icon)
+            except RuntimeError:
+                pass
 
 
     def _debounce_filter(self):
@@ -1079,27 +1088,43 @@ class SoftwareManagerPage(QWidget):
             if app.install_location:
                 loc = app.install_location.strip(chr(34))
                 if _os.path.exists(loc): residues.append(("Files", loc, L["id"] + ": " + loc))
-            for root_key, subpath in [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-            ]:
+            # 注册表残留只认两种：本应用自己的卸载键仍在，或存在与软件完全同名的
+            # 卸载键。之前用包含匹配，卸载 "Python 3.9" 会把 "Python Launcher" 等
+            # 无关软件也列为残留并可能被删掉。
+            own_key_alive = False
+            if app.registry_key:
                 try:
-                    key = winreg.OpenKey(root_key, subpath); i = 0
-                    while True:
-                        try:
-                            skn = winreg.EnumKey(key, i); full = subpath + chr(92) + skn
-                            sk = winreg.OpenKey(root_key, full)
+                    hive = winreg.HKEY_LOCAL_MACHINE if app.hive == "HKLM" else winreg.HKEY_CURRENT_USER
+                    k = winreg.OpenKey(hive, app.registry_key)
+                    winreg.CloseKey(k)
+                    own_key_alive = True
+                except OSError:
+                    own_key_alive = False
+            if own_key_alive:
+                residues.append(("Registry", app.registry_key, L["rk"] + ": " + app.name))
+            else:
+                nl = (app.name or "").lower()
+                for root_key, subpath in [
+                    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                ]:
+                    try:
+                        key = winreg.OpenKey(root_key, subpath); i = 0
+                        while True:
                             try:
-                                dn = winreg.QueryValueEx(sk, "DisplayName")[0]
-                                if app.name.lower() in str(dn).lower():
-                                    residues.append(("Registry", full, L["rk"] + ": " + dn))
-                            except: pass
-                            winreg.CloseKey(sk)
-                        except OSError: break
-                        i += 1
-                    winreg.CloseKey(key)
-                except: pass
+                                skn = winreg.EnumKey(key, i); full = subpath + chr(92) + skn
+                                sk = winreg.OpenKey(root_key, full)
+                                try:
+                                    dn = winreg.QueryValueEx(sk, "DisplayName")[0]
+                                    if nl and str(dn).lower() == nl:
+                                        residues.append(("Registry", full, L["rk"] + ": " + dn))
+                                except: pass
+                                winreg.CloseKey(sk)
+                            except OSError: break
+                            i += 1
+                        winreg.CloseKey(key)
+                    except: pass
         if not residues:
             self.log.append(L["nr"]); self.status_message.emit(L["cd"]); self._load(); return
         descs = chr(10).join(r[2] for r in residues[:10])
